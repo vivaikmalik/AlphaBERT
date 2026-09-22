@@ -1,0 +1,35 @@
+# --- Données brutes : ne JAMAIS versionner (volumineuses, licence WRDS/provider) ---
+# Le dossier réel s'appelle "data/" ; "Data/" est ajouté par sécurité (macOS est insensible à la casse).
+data/
+Data/
+*.parquet
+*.feather
+*.h5
+*.hdf5
+
+# --- Environnements virtuels et secrets ---
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# --- Python / Jupyter ---
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# --- Sorties volumineuses (prédictions, modèles entraînés, figures générées) ---
+outputs/
+*.pkl
+*.pickle
+*.joblib
+
+# --- Fichiers temporaires et système ---
+.DS_Store
+*.tmp
+*.log
+*.swp
+~$*
+.vscode/
+.idea/
