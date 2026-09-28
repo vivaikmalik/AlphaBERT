@@ -85,6 +85,13 @@ evaluation window is 01/2021–08/2026 inclusive (68 months) — `config.TEST_ST
 
 ## 0.2 The strategy, in one paragraph
 
+**A16 update (2026-09-28):** the headline signal described below (`pred_ew`, A12) and the beta
+formula it feeds into (A15) were both reverted to their pre-registered design because they were
+decided after test-period numbers had been seen; the headline is now `pred_gate` per
+`config.HEADLINE_SIGNAL`, with `pred_ew` kept as an ablation -- see docs/research_log.md's dated
+A16 entry and docs/SPEC.md section 10. The rest of this paragraph describes the pre-A16 (A12/A15)
+design and is left as historical context.
+
 AlphaBERT ranks 147 JKP-style monthly characteristics cross-sectionally and trains five
 LightGBM "specialists," one per economically grouped characteristic bucket (value, momentum,
 quality, investment/growth, risk/liquidity — **A9**), plus a sixth specialist trained only on

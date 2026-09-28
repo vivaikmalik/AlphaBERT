@@ -110,3 +110,11 @@ N_CAND 250->350 because with 250 the short candidates were too beta-lopsided (va
 -0.23 vs -0.07 at 350); cardinality guard keeps <=500 names. Validation: beta -0.07 (NW SE 0.14),
 2019 +0.03 / 2020 -0.10. Estimators rejected on validation: Dimson 21d blends (-0.43), missing->1.25
 only (-0.32), FP blend B1 (-0.24/-0.16), vol-neutral constraint (infeasible at 250; large IR cost).
+
+## 2026-09-28 -- A16 (2026-09-28): the team reverted A12 (headline back to the pre-registered ridge
+regime gate, pred_gate) and A15 (beta back to the pre-registered Blume-shrunk beta_60m, missing ->
+1.0, N_CAND 250), because both decisions were taken after test-period numbers had been seen. All
+other amendments are bug fixes or pre-test decisions and remain. The A12/A15 variants remain
+selectable via config.HEADLINE_SIGNAL / config.BETA_MODEL and pred_ew is always reported as an
+ablation. For reference, results already seen before this reversion (DGX runs): pre-registered beta
+run -- pred_ew IR 1.30, beta -0.33; pred_gate ablation IR 0.80. A15 run -- pred_ew IR 1.14, beta -0.27.

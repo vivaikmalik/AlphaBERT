@@ -102,8 +102,12 @@ def test_optimize_month_cardinality_guard_caps_at_500(rng, permnos, monkeypatch)
     with a large L2 penalty (which pushes the optimizer toward spreading weight thinly across as
     many candidates as it can, rather than concentrating in a few) and confirm optimize_month's
     guard (src/portfolio.py optimize_month, 'A15 cardinality guard') brings it back to <=500,
-    <=250 per leg, tagged 'cardinality' in relax, with all the usual constraints still holding."""
+    <=250 per leg, tagged 'cardinality' in relax, with all the usual constraints still holding.
+    N_CAND is forced to 350 here (A16 reverted the default to 250 under the pre-registered
+    'blume' beta model; this scenario needs 2*N_CAND=700 > 500 to be reachable at all, which
+    only happens under the A15 N_CAND=350 regime)."""
     monkeypatch.setattr(config, 'L2_PENALTY', 10_000.0)
+    monkeypatch.setattr(config, 'N_CAND', 350)
     m = make_month(rng, permnos)
 
     w, relax = optimize_month(m, pd.Series(dtype=float))

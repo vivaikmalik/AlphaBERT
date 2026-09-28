@@ -222,12 +222,14 @@ def test_miss_flags_use_only_cutoff_rows(tmp_path, monkeypatch):
 
 
 def test_beta_a15_formula_and_gics2_na(tmp_path, monkeypatch):
-    """A15 beta formula: b1 = BETA_FP_W*clip(betabab_1260d,-1,4) + BETA_FP_C (incl. the clip
+    """A15 beta formula (config.BETA_MODEL == 'a15', an ablation-only path since A16 reverted the
+    default to 'blume'): b1 = BETA_FP_W*clip(betabab_1260d,-1,4) + BETA_FP_C (incl. the clip
     biting on out-of-range betabab), falling back to a Blume-adjusted beta_60m (0.67*beta_60m +
     0.33) when betabab_1260d is missing, and to BETA_MISSING when both are missing; blended with
     ivp = within-eom percentile rank of ivol_capm_252d (0.5 when ivol_capm_252d is itself missing)
     as beta = BETA_INTERCEPT + BETA_SLOPE*b1 + BETA_IVOL*ivp. Also covers gics2 'NA' fill for
     missing gics (unrelated to the beta formula, kept from the pre-A15 version of this test)."""
+    monkeypatch.setattr(config, 'BETA_MODEL', 'a15')
     chars = config.load_char_list()
     rng = np.random.default_rng(4)
     eom = pd.Timestamp('2020-01-31')
@@ -294,6 +296,100 @@ def test_beta_a15_formula_and_gics2_na(tmp_path, monkeypatch):
     assert panel.loc[4006, 'gics2'] == '16'
 
 
+def test_beta_blume_formula_default(tmp_path, monkeypatch):
+    """Pre-registered ('blume') beta model, A16's default (config.BETA_MODEL == 'blume'):
+    beta = (1-BETA_SHRINK)*beta_60m + BETA_SHRINK*1.0, missing beta_60m -> 1.0 exactly. betabab_1260d
+    and ivol_capm_252d (the A15 formula's inputs) are set to very different values per row here and
+    must have no effect at all under this model."""
+    monkeypatch.setattr(config, 'BETA_MODEL', 'blume')
+    chars = config.load_char_list()
+    rng = np.random.default_rng(11)
+    eom = pd.Timestamp('2020-01-31')
+    # (beta_60m, betabab_1260d, ivol_capm_252d) -- betabab/ivol vary a lot per row on purpose.
+    specs = [
+        (1.2, 1.0, 0.01),
+        (0.5, 10.0, 0.02),
+        (np.nan, -5.0, 0.03),  # beta_60m missing -> blume beta must be exactly 1.0
+    ]
+    rows = []
+    for p, (beta60m, betabab, ivol252) in enumerate(specs):
+        row = {c: rng.normal(0, 1) for c in chars}
+        row.update({
+            'permno': 6000 + p, 'eom': eom, 'date': eom,
+            'prc': 20.0, 'me': 1_000_000.0,
+            'gics': f'{10 + p}101010',
+            'beta_60m': beta60m, 'betabab_1260d': betabab, 'ivol_capm_252d': ivol252,
+            'dolvol_126d': 1000.0, 'size_grp': 'mega',
+            'ticker': f'T{p}', 'company_name': f'C{p}',
+            'ret_exc_lead1m': rng.normal(0, 0.05),
+        })
+        rows.append(row)
+    raw = pd.DataFrame(rows)
+
+    chars_path = tmp_path / 'chars.parquet'
+    raw.to_parquet(chars_path)
+    cache_dir = tmp_path / 'cache'
+    cache_dir.mkdir()
+    monkeypatch.setattr(config, 'CHARS_PATH', chars_path)
+    monkeypatch.setattr(config, 'CACHE_DIR', cache_dir)
+
+    panel = build_panel().set_index('permno')
+
+    for p, (beta60m, betabab, ivol252) in enumerate(specs):
+        exp = 1.0 if np.isnan(beta60m) else (1 - config.BETA_SHRINK) * beta60m + config.BETA_SHRINK
+        assert panel.loc[6000 + p, 'beta'] == pytest.approx(exp), f"p{p}: beta mismatch"
+
+
+def test_panel_cache_filename_includes_beta_model(tmp_path, monkeypatch):
+    """build_panel()'s on-disk cache filename is settings-specific (panel_<BETA_MODEL>.parquet, A16):
+    switching config.BETA_MODEL must never silently reuse a panel cached under the other beta
+    model -- each model gets, and rebuilds into, its own cache file, and the other model's cache
+    file is left untouched (not overwritten, not read back)."""
+    chars = config.load_char_list()
+    rng = np.random.default_rng(13)
+    eom = pd.Timestamp('2020-01-31')
+    rows = []
+    for p, beta60m in enumerate([1.2, 0.5, 1.8]):
+        # id/aux columns set AFTER the chars fill (some chars share names with id/aux columns --
+        # see the module-level NOTE in src/data.py._build): must not be clobbered by the random fill.
+        row = {c: rng.normal(0, 1) for c in chars}
+        row.update({
+            'permno': 7000 + p, 'eom': eom, 'date': eom,
+            'prc': 20.0, 'me': 1_000_000.0,
+            'gics': f'{10 + p}101010',
+            'beta_60m': beta60m, 'betabab_1260d': 0.3 * (p + 1), 'ivol_capm_252d': 0.01 * (p + 1),
+            'dolvol_126d': 1000.0, 'size_grp': 'mega',
+            'ticker': f'T{p}', 'company_name': f'C{p}',
+            'ret_exc_lead1m': rng.normal(0, 0.05),
+        })
+        rows.append(row)
+    raw = pd.DataFrame(rows)
+    chars_path = tmp_path / 'chars.parquet'
+    raw.to_parquet(chars_path)
+    cache_dir = tmp_path / 'cache'
+    cache_dir.mkdir()
+    monkeypatch.setattr(config, 'CHARS_PATH', chars_path)
+    monkeypatch.setattr(config, 'CACHE_DIR', cache_dir)
+
+    monkeypatch.setattr(config, 'BETA_MODEL', 'blume')
+    panel_blume = build_panel()
+    assert (cache_dir / 'panel_blume.parquet').exists()
+    assert not (cache_dir / 'panel_a15.parquet').exists()
+    assert not (cache_dir / 'panel.parquet').exists()
+
+    monkeypatch.setattr(config, 'BETA_MODEL', 'a15')
+    panel_a15 = build_panel()
+    assert (cache_dir / 'panel_a15.parquet').exists()
+    assert (cache_dir / 'panel_blume.parquet').exists()  # untouched, still there
+
+    # beta actually differs between the two cached panels for at least one permno -- proves
+    # build_panel() recomputed under the new model rather than silently reading back the stale
+    # blume-model cache.
+    merged = panel_blume.set_index('permno')[['beta']].join(
+        panel_a15.set_index('permno')[['beta']], lsuffix='_blume', rsuffix='_a15')
+    assert not np.allclose(merged['beta_blume'], merged['beta_a15'])
+
+
 def test_ivp_ranks_within_eom_separately(tmp_path, monkeypatch):
     """ivp (the ivol_capm_252d percentile blended into 'beta', A15) is a within-eom rank
     (`.groupby(df['eom']).rank(pct=True)`), not a global rank -- two eoms whose ivol_capm_252d
@@ -301,6 +397,7 @@ def test_ivp_ranks_within_eom_separately(tmp_path, monkeypatch):
     same 'beta', since betabab_1260d/b1 is held constant here) at matching within-eom rank
     positions. A global rank would instead let eom2's uniformly-larger ivol scale dominate and
     push its ivp values above eom1's at every rank position."""
+    monkeypatch.setattr(config, 'BETA_MODEL', 'a15')  # ivp only feeds 'beta' under the A15 model
     chars = config.load_char_list()
     rng = np.random.default_rng(7)
     eom1 = pd.Timestamp('2020-01-31')

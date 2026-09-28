@@ -1,3 +1,5 @@
+import os
+
 import pandas as pd
 from pathlib import Path
 
@@ -29,11 +31,19 @@ MISS_FLAG_RATE = 0.20
 
 MIN_PRICE = 5.0
 ME_CUTOFF_PCTILE = 0.20
-BETA_SHRINK = 0.33  # unused by src/data.py as of A15 (beta model fix); kept because docs/guide/*.md
-# and docs/SPEC.md section 3 (not owned by this amendment -- only section 10 may be appended)
-# still describe the pre-A15 beta formula in terms of it.
 
-# A15 (beta model fix, docs/SPEC.md section 10): beta = BETA_INTERCEPT + BETA_SLOPE*b1 + BETA_IVOL*ivp,
+# A16 (2026-09-28, docs/SPEC.md section 10): A12 (headline) and A15 (beta model) were both decided
+# after test-period numbers had been seen, so both are reverted to their pre-registered design here.
+# Each switch keeps the other (post-hoc) variant selectable so both stay reproducible.
+HEADLINE_SIGNAL = 'pred_gate'  # pre-registered headline (ridge regime gate); A12 alternative: 'pred_ew'
+BETA_MODEL = 'blume'  # pre-registered beta model; A15 alternative: 'a15' (FP beta + ivol blend)
+
+BETA_SHRINK = 0.33  # pre-registered ('blume') beta model, used by src/data.py when BETA_MODEL ==
+# 'blume': beta = (1-BETA_SHRINK)*beta_60m + BETA_SHRINK*1.0 (missing beta_60m -> 1.0).
+
+# A15 (beta model fix, docs/SPEC.md section 10; used by src/data.py only when BETA_MODEL == 'a15',
+# now an ablation-only path per A16 -- decided after test-period numbers had been seen):
+# beta = BETA_INTERCEPT + BETA_SLOPE*b1 + BETA_IVOL*ivp,
 # where b1 = BETA_FP_W*clip(betabab_1260d,-1,4) + BETA_FP_C, falling back to a Blume-adjusted
 # beta_60m (0.67*beta_60m + 0.33) when betabab_1260d is missing, and to BETA_MISSING when both are
 # missing; ivp = within-eom percentile rank of ivol_capm_252d (0.5 if missing). BETA_INTERCEPT/
@@ -52,7 +62,9 @@ STATE_VARS = ['mkt_vol12', 'disp']
 
 GROSS = 2.0
 MAX_WEIGHT = 0.015
-N_CAND = 350  # A15: raised from 250 -- validation beta was too short-lopsided at 250 (see A15 log)
+N_CAND = 250 if BETA_MODEL == 'blume' else 350  # A15 raised 250->350 only together with the new
+# beta model (validation beta was too short-lopsided at 250; see A15 research log entry); A16
+# reverts to the pre-registered 250 under the pre-registered ('blume') beta model.
 EMA_ALPHA = 0.5
 
 TURNOVER_PENALTY = 0.5   # placeholder, calibrated later on 2019-2020 validation only
@@ -65,7 +77,8 @@ SIZE_TOL = 0.05
 COST_BPS = 10
 HURDLE_ANNUAL = 0.04
 
-N_JOBS = 6
+N_JOBS = int(os.environ.get('ALPHABERT_NJOBS', 6))  # env override so other machines never need to
+# edit config.py directly
 
 
 def load_char_list() -> list[str]:

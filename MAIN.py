@@ -12,14 +12,18 @@ Steps (each a thin call into the owning src module -- no modeling/portfolio logi
   2. Attach text (8-K) features; tone columns are included only when the settings-specific FinBERT
      score cache (text.scores_path_for(text.MAX_LENGTH)) is a complete run.
   3. models.run_all(): baselines, the five A9 characteristic specialists + text, and the ridge
-     gate, per test year -> OOS R2/IC table (pred_ew_ret is reported as the headline's R2, A12).
+     gate, per test year -> OOS R2/IC table. The headline's R2 comes from config.HEADLINE_SIGNAL:
+     when it's pred_ew (A12), pred_ew_ret (its return-unit twin) is reported; when it's pred_gate
+     (pre-registered, A16), pred_gate is itself return-unit and already has an R2 in the table.
   4. Calibrate the optimizer's two penalties ONCE on the SMOOTHED 2019-2020 validation pred_ew
      signal (A3, amended: smoothed via portfolio.smooth, not raw), then lock them.
-  5. Headline backtest: pred_ew (A12, post-hoc headline switch -- see docs/research_log.md), the
-     neutral optimizer (A14 sector-demeaned candidates) over formation months 2020-12..2026-07,
-     labels, and an adverse missing-return sensitivity check.
-  6. Same locked penalties/smoothing for every ablation signal (pred_gate + notext, pred_ew_notext,
-     pred_lgbm_all, pred_ridge, every pred_spec_*).
+  5. Headline backtest: config.HEADLINE_SIGNAL (pred_gate, the pre-registered ridge regime gate,
+     per A16 -- see docs/research_log.md; A12's pred_ew was a post-hoc headline switch and is now
+     reported only as an ablation), the neutral optimizer (A14 sector-demeaned candidates) over
+     formation months 2020-12..2026-07, labels, and an adverse missing-return sensitivity check.
+  6. Same locked penalties/smoothing for every ablation signal: the other combiner (whichever of
+     pred_gate/pred_gate_notext/pred_ew/pred_ew_notext isn't the headline), pred_lgbm_all,
+     pred_ridge, every pred_spec_*. The headline column is never backtested twice.
   7. evaluate.run_evaluation() for tables/charts; write the 3-file submission.
   8. Print the headline performance dict.
 """
@@ -33,11 +37,33 @@ from src import config, data, text, models, portfolio, evaluate
 
 def run_signal(col, test_preds, panel, market, l2, tc):
     """Smooth preds column `col` into a signal and run the neutral optimizer backtest over it.
-    Shared by the headline (pred_ew) and every ablation signal so they use identical smoothing
-    and locked penalties."""
+    Shared by the headline (config.HEADLINE_SIGNAL) and every ablation signal so they use
+    identical smoothing and locked penalties."""
     sig = test_preds[['permno', 'eom']].copy()
     sig['signal'] = portfolio.smooth(test_preds, col)
     return portfolio.backtest(sig, panel, market, l2=l2, tc=tc)
+
+
+def ablation_columns(headline_signal, specialist_cols):
+    """Every ablation signal for step 6: the other combiner (whichever of pred_gate/
+    pred_gate_notext/pred_ew/pred_ew_notext isn't `headline_signal`), plus the fixed and
+    specialist ablations. Never includes `headline_signal` itself (A16: the headline column is
+    never backtested twice)."""
+    combiner_cols = ['pred_gate', 'pred_gate_notext', 'pred_ew', 'pred_ew_notext']
+    combiner_ablations = [c for c in combiner_cols if c != headline_signal]
+    fixed_ablations = combiner_ablations + ['pred_lgbm_all', 'pred_ridge']
+    return fixed_ablations + sorted(specialist_cols)
+
+
+def headline_r2_row(r2, headline_signal):
+    """(model_col, oos_r2) for the headline's row in `r2` (models.r2_table output), or None if
+    that column isn't present. pred_ew stays z-score-valued (A12): its return-unit twin
+    pred_ew_ret carries the R2 instead. Any other headline (e.g. pred_gate, A16's pre-registered
+    default) is itself return-unit and has its own row -- no substitution needed."""
+    col = 'pred_ew_ret' if headline_signal == 'pred_ew' else headline_signal
+    if col not in r2['model'].values:
+        return None
+    return col, r2.loc[r2['model'] == col, 'oos_r2'].iloc[0]
 
 
 def main():
@@ -98,9 +124,10 @@ def main():
     r2 = models.r2_table(preds)
     print('OOS R2 / IC table (test rows):')
     print(r2.to_string(index=False))
-    if 'pred_ew_ret' in r2['model'].values:
-        headline_r2 = r2.loc[r2['model'] == 'pred_ew_ret', 'oos_r2'].iloc[0]
-        print(f'headline OOS R2 (pred_ew_ret, the return-unit version of pred_ew, A12): {headline_r2}')
+    headline_r2 = headline_r2_row(r2, config.HEADLINE_SIGNAL)
+    if headline_r2 is not None:
+        col, val = headline_r2
+        print(f'headline OOS R2 ({col}, config.HEADLINE_SIGNAL={config.HEADLINE_SIGNAL}): {val}')
     r2.to_csv(config.TABLE_DIR / 'oos_r2.csv', index=False)
 
     # ---- 4. calibrate portfolio penalties on the SMOOTHED 2019-2020 validation pred_ew, lock ---
@@ -113,22 +140,23 @@ def main():
     print(calib_table.to_string(index=False))
     calib_table.to_csv(config.TABLE_DIR / 'calibration.csv', index=False)
 
-    # ---- 5. headline backtest: pred_ew, smoothed, over formation months 2020-12..2026-07 -------
-    print('=== step 5/8: headline backtest (pred_ew: equal-weight blend of 6 specialists) ===')
+    # ---- 5. headline backtest: config.HEADLINE_SIGNAL, smoothed, formation months 2020-12..2026-07
+    print(f'=== step 5/8: headline backtest ({config.HEADLINE_SIGNAL}) ===')
     test_preds = preds.loc[preds['split'] == 'test']
-    holdings, returns = run_signal('pred_ew', test_preds, panel, market, l2, tc)
+    holdings, returns = run_signal(config.HEADLINE_SIGNAL, test_preds, panel, market, l2, tc)
     label_panel, filing_labels = portfolio.load_label_sources()
     holdings = portfolio.attach_labels(holdings, label_panel, filing_labels)
     sensitivity = portfolio.missing_return_sensitivity(holdings, panel, returns)
 
     # ---- 6. ablations: same locked penalties, same smoothing, every alternative signal ---------
-    # pred_gate (the regime-conditioned ridge combiner) is reported here, not as the headline: it
-    # underperformed the plain equal-weight blend on the validation window (A12), so this is a
-    # failed-on-validation ablation, not a lesser alternative promoted post hoc from test results.
+    # The other combiner is always reported as an ablation here, never as the headline: A16
+    # reverted config.HEADLINE_SIGNAL to pred_gate (pre-registered ridge regime gate); pred_ew (the
+    # post-hoc A12 headline) and its _notext variant are ablations now. If HEADLINE_SIGNAL were
+    # switched back to 'pred_ew', pred_gate/pred_gate_notext would be the ablations instead -- the
+    # headline column itself is never backtested twice.
     print('=== step 6/8: ablations ===')
-    fixed_ablations = ['pred_gate', 'pred_gate_notext', 'pred_ew_notext', 'pred_lgbm_all', 'pred_ridge']
-    specialist_ablations = sorted(c for c in test_preds.columns if c.startswith('pred_spec_'))
-    ablation_cols = fixed_ablations + specialist_ablations
+    specialist_cols = [c for c in test_preds.columns if c.startswith('pred_spec_')]
+    ablation_cols = ablation_columns(config.HEADLINE_SIGNAL, specialist_cols)
     ablations = {}
     ablation_failures = []
     for col in ablation_cols:
