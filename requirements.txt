@@ -5,3 +5,12 @@ scikit-learn
 matplotlib
 jupyter
 ipykernel
+lightgbm
+cvxpy
+statsmodels
+pytest
+duckdb
+yfinance
+scipy
+torch
+transformers

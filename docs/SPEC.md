@@ -1,0 +1,114 @@
+# AlphaBERT — implementation spec (shared contract; source of truth)
+
+## 0. Principles
+- Simplest code that works: plain functions, pandas/numpy, no classes unless unavoidable, no frameworks, `print` for logging. Short modules. No speculative options/flags.
+- Competition rules (McGill-FIAM brief) override everything. ZERO look-ahead. When in doubt, be conservative and document.
+- Each module owns `tests/test_<module>.py`. Unit tests use small synthetic data and run in seconds. Tests reading the real parquet files are marked `@pytest.mark.slow`.
+- Never edit a file owned by another module. If you need a change elsewhere, say so in your final report.
+- Imports: `from src import config` / `from src.data import ...`. Run tests with `python -m pytest`.
+- Caches go in `config.CACHE_DIR` as parquet. Figures in `FIG_DIR` (png), tables in `TABLE_DIR` (csv), submission files in `SUB_DIR`.
+
+## 1. Layout
+```
+MAIN.py            end-to-end orchestration (one entry point)
+src/config.py      constants and paths only
+src/data.py        panel, universe, ranks, market state, external market data
+src/text.py        8-K cleaning, FinBERT scoring (cached), text features
+src/models.py      schedule, baselines, specialists, gate, OOS R2 / IC
+src/portfolio.py   signal smoothing, optimizer, backtest accounting, submission files
+src/evaluate.py    statistics, charts, regime + ablation tables
+tests/             one test file per module + tests/test_integrity.py (leakage suite)
+```
+
+## 2. Time conventions (CRITICAL)
+- `eom` = formation month t (month-end, datetime64[ns]). Every feature on row `eom=t` uses only information available by the end of month t.
+- `target_month` = month-end of t+1. `stock_exret` = `ret_exc_lead1m` (excess return realized during target_month). It is already led: never shift it again; never use it (or anything derived from it) as a feature.
+- Positions are formed at end of t, held during target_month.
+- All train/valid/test assignment is by `target_month`. For test year Y in 2021..2026: train = target months 2015-02..(Y-3)-12; valid = (Y-2)-01..(Y-1)-12; test = Y-01..Y-12 (2026: through 2026-08). Model coefficients are fitted on train only; hyperparameters (incl. early stopping) and the gate on valid only. No refit on valid. No refit within a year (annual refits, monthly forecasts).
+- Test holding months: 2021-01..2026-08 (68 months) = formation months 2020-12..2026-07.
+- Universe membership is decided from month-t information only and never from whether `stock_exret` exists. Training/validation rows additionally require non-null `stock_exret` (a label is needed to fit); test rows do not.
+
+## 3. data.py
+- `load_chars(columns=None) -> DataFrame`: read CHARS_PATH (optionally selected columns), convert `eom` and `date` to datetime64.
+- `universe_mask(raw) -> bool Series`: `prc >= MIN_PRICE` and `me >=` the ME_CUTOFF_PCTILE quantile of `me` among all rows of the same `eom`. Never touches `ret_exc_lead1m`.
+- `build_panel() -> DataFrame` (cached at CACHE_DIR/'panel.parquet'): universe rows only. Columns:
+  - `permno, eom, target_month, stock_exret, date`
+  - the 147 characteristics (same names), each ranked within `eom` to [-1, 1] as `2*(rank-1)/(n-1) - 1` over non-null values (average ties), then NaN -> 0.
+  - `miss_<char>` int8 flags for chars whose missing rate among universe rows with eom <= MISS_FLAG_CUTOFF exceeds MISS_FLAG_RATE (flag = raw value was null).
+  - aux (not features): `gics2` (first 2 chars of gics, 'NA' if null), `beta` = (1-BETA_SHRINK)*beta_60m + BETA_SHRINK*1.0 on RAW beta_60m, 1.0 if missing; `size_z` = within-eom z-score of log(me); raw `me, prc, dolvol_126d, size_grp, ticker, company_name`.
+- `feature_columns(panel) -> list[str]`: 147 chars + miss_ flags, in a stable order.
+- `market_state() -> DataFrame` indexed by eom: `mkt_ret` (me_lag1-weighted mean of `ret` over all panel rows that month, me as fallback weight), `mkt_ret12` (compounded mkt_ret over the 12 months ending t, min 6), `mkt_vol12` (std of mkt_ret over 12 months ending t, min 6), `disp` (cross-sectional std of `ret` over universe rows), `ivol` (mean ivol_capm_21d over universe rows). Uses data <= t only.
+- `load_market() -> DataFrame` indexed by holding month-end: `tb3ms` (annual %), `rf_m` = tb3ms/1200, `sp500_ret` (monthly total return, decimal), `sp500_exret` = sp500_ret - rf_m, `sp500_source`. Downloads once into EXT_DIR (tb3ms.csv, sp500.csv, SOURCES.md), then reads the cache. TB3MS from FRED (https://fred.stlouisfed.org/graph/fredgraph.csv?id=TB3MS); FRED dates are first-of-month -> map to that month's month-end. S&P 500 total return: yfinance `^SP500TR` month-end closes -> pct_change; fallback FRED `SP500` price index labelled 'price_only'. Must cover 2020-12..2026-08 at least.
+
+## 4. text.py
+- `clean_text(text, names) -> str`: drop the SEC cover page (start at the first `Item \d\.\d\d` occurring after the cover-page check-box block, i.e. after phrases like "emerging growth company"/"Check the appropriate box"; fallback: drop the first 1,500 chars), strip recurring safe-harbor/furnished/incorporated-by-reference boilerplate and everything from Item 9.01/exhibits/signature block onward, replace company names/tickers (narrow: case-sensitive suffix-stripped name variants gated on length/word-count; tickers only in an explicit exchange context, e.g. "NYSE: TICK") with "the Company", collapse whitespace.
+- `score_finbert()` -> writes `scores_path_for(max_length)` = CACHE_DIR/'finbert_scores_L{max_length}.parquet' (settings-specific filename, so different max_length/cleaning runs never silently mix; the legacy CPU 'finbert_scores.parquet' with no L-suffix is never picked up) with `document_id, permno, filing_date, fb_pos, fb_neg, fb_neu`. Model ProsusAI/finbert, revision-pinned (its training text predates 2021: model-side look-ahead guard; A7). Truncation to `MAX_LENGTH` (512 -- BERT's own positional-embedding limit, the full cleaned event body, not just an opening lead; moved from a CPU-bound 128/192 once GPU scoring removed the compute constraint), resumable in chunks (skip already-scored document_ids), runnable as `python -m src.text --score`. An empty cleaned text scores NaN (`score_texts_safe`), excluded from tone aggregates.
+- `build_text_features() -> DataFrame` keyed (`permno`, `eom`) with eom = month-end of `filing_date`: `n_filings`, `item_<x_yy>` counts for config.KEY_ITEMS (e.g. item_2_02), `has_filing` (aux, not a model feature -- see A1), and if `scores_path_for(MAX_LENGTH)` exists: `tone_mean` = mean(fb_pos - fb_neg), `tone_min`, `fb_neg_max`. NOT cached to parquet -- rebuilds in seconds from the cached FinBERT scores on every call, so it can never go stale relative to the scores file.
+- `add_text_features(panel) -> panel`: left join on (permno, eom); stock-months with no filing get 0 counts, 0 tone and `has_filing = 0` (a state, not missing data). `TEXT_FEATURES` (list) names the model-feature text columns only; per A1, `has_filing` is excluded from `TEXT_FEATURES` (survivorship leak) and carried as a separate aux column instead.
+- Invariant: features at eom t use only filings with filing_date in calendar month t.
+
+## 5. models.py
+*Superseded in part by §10 (A9–A14); where they differ, §10 and the code are authoritative.*
+- `CHAR_GROUPS = {'value': [...], 'momentum': [...], 'quality': [...], 'risk_liquidity': [...]}` covering all 147 chars exactly once (economic grouping per the JKP-style taxonomy: value/fundamentals-to-price; past returns/momentum/reversal/seasonality; profitability/quality/accruals/investment/growth/issuance; size/liquidity/volatility/beta/skewness/trading). `miss_<c>` flags go with their char's group.
+- `splits(panel, test_year) -> (train_mask, valid_mask, test_mask)` per section 2.
+- `make_target(df) -> Series`: stock_exret demeaned within target_month, then clipped at the within-month 1st/99th percentiles.
+- Baselines on all features: OLS, Ridge, Lasso, ElasticNet (alpha grid chosen on valid MSE, as in penalized_linear_hackathon.py), single LightGBM on all features (`lgbm_all`).
+- `fit_lgbm(Xtr, ytr, Xva, yva)`: small grid (num_leaves in {7, 15}), learning_rate 0.05, min_child_samples 1000, feature_fraction 0.5, bagging_fraction 0.8 / bagging_freq 1, lambda_l2 10, up to 1000 rounds with early stopping (50) on valid; pick by valid MSE; seed config.SEED; n_jobs config.N_JOBS.
+- Specialists: one fit_lgbm per CHAR_GROUP plus `text` (on text.TEXT_FEATURES).
+- Gate: z-score each specialist forecast within eom -> Z_k. Gate design = [Z_k] + [Z_k * s_j] for s_j in config.STATE_VARS, s_j standardized with the valid-window mean/std. RidgeCV fitted on valid rows against make_target; applied to test rows. `gate_notext` = same without the text specialist. `ew` / `ew_notext` = mean of Z_k. Save gate coefficients per test year.
+- `run_all(panel, state) -> DataFrame` saved to CACHE_DIR/'preds.parquet': `permno, eom, target_month, stock_exret, test_year, split` ('valid' or 'test') and `pred_ols, pred_ridge, pred_lasso, pred_enet, pred_lgbm_all, pred_spec_value, pred_spec_momentum, pred_spec_quality, pred_spec_investment_growth, pred_spec_risk_liquidity, pred_spec_text, pred_gate, pred_gate_notext, pred_ew, pred_ew_notext, pred_ew_ret` (per A9, five characteristic specialists, not four). `pred_ew_ret` is a return-unit version of `pred_ew` (the headline per A12) used only so `oos_r2` has a return-denominated number to score against `stock_exret`; `pred_ew` itself stays z-score-valued (IC only, R2 not meaningful). Test rows for every test year; 'valid' rows only for test_year 2021 (the 2019-2020 window, used for portfolio calibration). Gate coefs saved to CACHE_DIR/'gate_coefs.parquet'.
+- `oos_r2(y, yhat) = 1 - sum((y-yhat)^2) / sum(y^2)` (zero benchmark, brief's formula). `monthly_ic(df, col)` = Spearman corr per eom. `r2_table(preds)` -> OOS R2 (vs raw stock_exret and vs demeaned), mean IC, IC t-stat per model, test rows with non-null stock_exret only. `pred_ew_ret`'s OOS R2 is reported as the headline's R2 (A12); `pred_ew`/`pred_ew_notext` remain IC-only (NaN R2).
+
+## 6. portfolio.py
+*Superseded in part by §10 (A9–A14); where they differ, §10 and the code are authoritative.*
+- `smooth(df, col) -> Series`: z-score `col` within eom, then per-permno EMA over formation months in date order (s_t = EMA_ALPHA*z_t + (1-EMA_ALPHA)*s_{t-1}; reset if the permno skipped a month). Past values only.
+- `optimize_month(m, w_prev) -> Series(permno -> weight)`: m has `permno, signal, beta, gics2, size_z`. Long candidates = top N_CAND by signal, short candidates = bottom N_CAND. cvxpy: maximize signal@w - TURNOVER_PENALTY*norm1(w - w_prev) - L2_PENALTY*sum_squares(w), s.t. 0<=w<=MAX_WEIGHT on long candidates, -MAX_WEIGHT<=w<=0 on short candidates, 0 elsewhere, sum(long)=1, sum(short)=-1 (gross 200%, net 0), |beta@w|<=BETA_TOL, |sector exposure|<=SECTOR_TOL for each gics2, |size_z@w|<=SIZE_TOL. If infeasible: relax SECTOR_TOL, then SIZE_TOL, then BETA_TOL by x2 steps (print what was relaxed). Afterwards drop |w|<1e-5 and rescale each leg back to exactly +1 / -1. Must return 100..500 names (assert).
+- `backtest(signal_df, panel, market) -> (holdings, returns)`: loop over formation months in order. `holdings`: `month` (holding month-end), `eom`, `permno`, `weight` (decimal, signed), `ticker`, `company_name`, `label_source`. `returns` indexed by holding month-end `month`:
+  - r_i = stock_exret (missing -> 0, and record `missing_ret_weight` = sum |w| of such names)
+  - `long_ret` = sum_{w>0} w*r, `short_ret` = sum_{w<0} w*r, `ls_ret` = long_ret + short_ret. Because sum(w)=0 exactly, the pipeline RF cancels and ls_ret is the long-short return on $1 of capital per leg.
+  - Capital convention: $100 capital, $100 long, $100 short, collateral earns the T-bill. `rf_m` from load_market, `total_ret` = rf_m + ls_ret, `bench_ret` = rf_m + HURDLE_ANNUAL/12, `active_ret` = total_ret - bench_ret.
+  - `sp500_ret, sp500_exret`, `n_long, n_short, gross (= sum|w|), net (= sum w), beta_exante (= beta@w)`.
+  - `turnover` = 0.5*sum|w_t - w_{t-1}| / GROSS (one-way, % of gross; full replacement = 1.0; first month vs empty book, flagged and excluded from averages by evaluate). `cost` = COST_BPS/1e4 * sum|w_t - w_{t-1}|. `total_ret_net` = total_ret - cost, `active_ret_net` = active_ret - cost.
+- Labels: ticker/company_name from the panel row at formation month; if null, the most recent earlier non-null label for that permno in the raw panel (dated <= eom), else the latest 8-K filing label for that permno with filing_date <= eom, else 'UNLABELED'. `label_source` records which.
+- `write_submission(holdings, returns)`: SUB_DIR/'holdings.csv' columns `Date` (first day of holding month, YYYY-MM-DD), `PERMNO`, `TICKER`, `COMPANY NAME`, `WEIGHT` (signed, in percent of NAV: 1.5 means 1.5%); SUB_DIR/'returns.csv' columns `Date, total_ret, rf_m, bench_ret, active_ret, ls_ret, long_ret, short_ret, sp500_ret` (decimal); SUB_DIR/'label_audit.csv' (permno, month, ticker, company_name, label_source).
+
+## 7. evaluate.py
+*Superseded in part by §10 (A9–A14); where they differ, §10 and the code are authoritative.*
+Inputs: the `returns` and `holdings` frames above, the panel, preds, gate coefs. Test window only (2021-01..2026-08).
+- `performance_table(returns)`: for strategy (total_ret), benchmark (bench_ret), S&P 500 (sp500_ret): avg monthly return, annualized arithmetic (x12), CAGR, cumulative, best/worst month with dates, hit rate (share of months active_ret>0; strategy), IR = sqrt(12)*mean(active)/std(active) (active vs bench_ret; for S&P use sp500_ret - bench_ret), Sharpe = sqrt(12)*mean(ret - rf_m)/std(ret - rf_m), max drawdown of cumulative total return, correlation with S&P 500. Long leg and short leg average/cumulative contributions. Gross and net-of-cost versions of the strategy.
+- `alpha_beta(returns)`: OLS of (total_ret - rf_m) on sp500_exret: alpha (monthly and x12), beta, OLS SE and Newey-West (3 lags) SE and t-stats.
+- `calendar_year_table`, `exposure_table(returns, holdings)`: avg n_long/n_short, gross avg/max, net avg/min/max, avg/max |weight|, top-10 share of gross, turnover avg/min/max (excluding first month), ex-ante beta avg.
+- `short_book_table(holdings, panel)`: avg me, avg dolvol_126d of short names (weight-averaged and simple), share of short weight in size_grp in {'nano','micro'}, share of short weight in the bottom quintile of dolvol_126d within the universe that month.
+- `contributors(holdings, panel)`: sum over months of w*stock_exret by permno, top 10 and bottom 10 with "TICKER, Company Name".
+- `top_holdings(holdings)`: top 10 long / top 10 short by average weight over the test period with labels.
+- `regime_table(returns)`: periods 2021, 2022, 2023-2025, 2026: IR, ann. active return, long/short leg contributions.
+- Charts (png, labelled with period and gross/net): cumulative (strategy vs benchmark vs S&P), underwater (strategy with S&P overlaid), rolling 12m active return, rolling 12m IR, rolling 12m beta, histogram of monthly total returns with the monthly hurdle marked, top/bottom contributors bar chart, gate effective weights over time (b_k + sum_j c_kj * s_j(t)).
+- `ablation_table(results)`: for each signal variant's backtest: IR, Sharpe, ann. active, beta, turnover, max DD.
+
+## 8. Integrity suite (tests/test_integrity.py, mostly slow)
+- stock_exret at (permno, t) equals ret_exc at (permno, t+1) in the raw panel where consecutive months exist (sampled).
+- Truncation invariance: build ranks/flags/aux, market_state and text features using only data with eom <= T (filings with filing_date <= T); values for month T equal the full-data build.
+- Universe unchanged when stock_exret is randomly set to NaN.
+- Feature columns never include stock_exret, ret_exc_lead1m, target_month or anything derived from them.
+- Schedule: max(train target) < min(valid target) < min(test target), per year; union of test months = 2021-01..2026-08.
+- Shuffled-label test: shuffling stock_exret within month in train+valid gives test mean IC ~ 0 (|IC| < 0.01) for a fast model.
+- Holdings: every month 100 <= names <= 500, gross <= 2 + 1e-6, |net| <= 0.5 (and ~0), max |w| <= MAX_WEIGHT + 1e-6, |beta@w| small; holdings months = 2021-01..2026-08.
+
+## 9. MAIN.py
+Load/build panel -> text features -> market state -> models.run_all -> calibrate penalties on the SMOOTHED 2019-2020 validation pred_ew signal only (A3, amended) -> backtest headline (pred_ew, per A12; pred_gate was the pre-registered headline but is now reported only as an ablation) + ablations (pred_gate and pred_gate_notext, pred_ew_notext, pred_lgbm_all, pred_ridge, every pred_spec_*) -> evaluate -> write submission. Cache-aware; `python MAIN.py` reproduces everything from the raw files.
+
+## 10. Amendments (2026-09-27, after Opus spec review)
+- A1 Survivorship: 8-K filing coverage in this retrospectively assembled archive encodes future survival. Corrected measurement (text.filing_coverage_by_exit(); exit = permno's last appearance in the RAW characteristics file, 12+ months before the raw data's own last eom so right-censored near-term dropouts are excluded; coverage over universe stock-months only): same-month (last panel row before exit) 1.3%, 1-2 months before exit 3.3%, 3-5 months before exit 3.6%, 6-11 months before exit 3.9%, 12+ months before exit 8.9%, survivors to panel end 59.7%. (Superseded 2026-09-27 figure: "0-2.6% vs 40-58%", an earlier, less careful measurement -- see docs/research_log.md.) So `has_filing` is NOT a feature; text.TEXT_FEATURES = within-filer features only (n_filings, item_* counts, tone_mean, tone_min, fb_neg_max); the text specialist is trained/predicted on filer rows only; its within-month z-score is computed among filers and non-filers get exactly 0. Disclose in the deck.
+- A2 Validation hygiene: specialists and lgbm_all choose num_leaves/early stopping on an inner holdout = last 12 target months of the training window, then refit on the full training window with the chosen settings. The 24-month validation window is used only by the gate (and by linear baselines' alpha, which are template baselines). Gate ridge alpha is chosen by CV grouped by month (GroupKFold on eom).
+- A3 Portfolio penalty calibration uses pred_ew 2019-2020 validation predictions (no fitted combiner), then locked. Amended 2026-09-27: calibration runs on the SMOOTHED pred_ew validation signal (portfolio.smooth, not the raw within-eom z-score) and calibrate() now reuses backtest()'s per-month optimizer call directly, so it also enforces the filer-net constraint (A10) exactly as the real backtest does. Decided without seeing any test-period returns.
+- A4 Missing next-month returns (0.47% of test-universe stock-months, all true exits) stay 0 in the headline; an adverse sensitivity (-30% longs / +30% shorts) is reported. Labels are never zero-filled for training.
+- A5 returns.csv uses first-of-holding-month Date like holdings.csv and adds total_ret_net, active_ret_net; total_ret (gross of costs) is the headline. Turnover is target-to-target (not drifted), stated as such. Benchmark Sharpe reported N/A. Exposure table reports ranges (min/avg/max).
+- A6 Submission requires one file MAIN.py: final step bundles src modules into a single self-contained MAIN.py (to be built at integration).
+- A7 FinBERT revision pinned (hash recorded in src/text.py FINBERT_REVISION); deck cites its pre-2021 training corpora (BERT 2018, TRC2 2008-10, Financial PhraseBank 2014).
+- A8 Deck-visible holdings whose label_source is not the same-month panel label get verified against SEC EDGAR (by CIK) with the URL recorded in label_audit.csv.
+- A9 (decided on economic grounds before any 2021-2026 result was seen): characteristic specialists become five: value, momentum, quality (profitability/earnings quality/safety), investment_growth (asset/investment growth, accruals, issuance: FF5 RMW vs CMA, HXZ ROE vs I/A, Stambaugh-Yuan PERF vs MGMT), risk_liquidity. ebit_bev and sale_bev move from value to quality (profitability/turnover on book EV, not price ratios). Headline = gate over 6 specialists (5 char + text).
+- A10 Filer-net-neutral: portfolio adds |sum of w over has_filing==1 names| <= SECTOR_TOL, because the filer-only text z-score (0 for non-filers) mechanically pushes filers into the signal tails (Opus finding: filer share of top-250 61% vs 48% base under pred_ew).
+- A11 Valid-window predictions are made for all rows (incl. null-label future exits); gate fitted on labelled rows only.
+- A12 (post-hoc, disclosed): headline signal switched from the ridge regime gate to the equal-weight blend of the six specialist z-scores (pred_ew). Disclosure: an interface smoke run had printed test-period ICs (gate 0.022 vs equal-weight 0.065) before this decision. The decision rests on validation-window evidence only: a split-half pseudo-out-of-sample test inside each 24-month validation window (fit on one 12-month half, evaluate on the other) gave mean IC gate -0.012, gate with n-scaled alpha 0.004, gate without state 0.009, NNLS 0.025, IC-weighted 0.038, equal-weight 0.044 (best in 5 of 6 years, never negative). Mechanism: ~24 monthly observations cannot identify 18 gate parameters; pooled-MSE fits flip factor signs after a bad factor year; state interactions add noise (cf. DeMiguel, Garlappi & Uppal 2009 on 1/N). The gate is kept as an ablation and explainability exhibit.
+- A13: specialist boosting rounds and num_leaves are chosen by mean monthly Spearman IC on the inner holdout (last 12 target months of training), not pooled MSE (MSE early stopping selected 1-tree models, e.g. 7 distinct predictions). Rounds evaluated on a fixed grid, floor 100. Gate ridge alpha grid scaled by n (len(y) * logspace(-3, 2, 11)).
+- A14 (decided without seeing any test-period returns): candidate selection for the optimizer (long/short top/bottom N_CAND by signal) is now sector-demeaned -- signal is demeaned within gics2 before ranking into candidates -- because the plain top/bottom-N_CAND selection left the optimizer infeasible at the base tolerances in 3-14 of 24 VALIDATION months per test year: the worst GICS2 sector's minimum achievable net exposure was 9.85%, above the 6% cap available even after the 'sector x2' relaxation rung (SECTOR_TOL=0.03 doubled). Diagnosed and logged in docs/research_log.md (2026-09-27, "_check_constraints relaxed-tolerance bug, and a real-data infeasibility diagnosis" entry) as a lopsided candidate-set composition (one sector dominating one side's candidates) rather than a solver bug. See docs/research_log.md's Disclosure & timeline entry for the full timeline of A9/A12/A13/A14 relative to the smoke-run OOS R2 table (docs/smoke_run_oos_r2_2026-09-27.csv).
