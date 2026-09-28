@@ -130,10 +130,18 @@ def main():
     specialist_ablations = sorted(c for c in test_preds.columns if c.startswith('pred_spec_'))
     ablation_cols = fixed_ablations + specialist_ablations
     ablations = {}
+    ablation_failures = []
     for col in ablation_cols:
-        _, ab_returns = run_signal(col, test_preds, panel, market, l2, tc)
+        try:
+            _, ab_returns = run_signal(col, test_preds, panel, market, l2, tc)
+        except RuntimeError as e:
+            print(f'  ablation FAILED (infeasible under neutrality constraints): {col}: {e}')
+            ablation_failures.append(dict(signal=col, error=str(e)))
+            continue
         ablations[col] = ab_returns
         print(f'  ablation done: {col}')
+    pd.DataFrame(ablation_failures, columns=['signal', 'error']).to_csv(
+        config.TABLE_DIR / 'ablation_failures.csv', index=False)
 
     # ---- 7. evaluate + write submission ---------------------------------------------------------
     print('=== step 7/8: evaluate ===')

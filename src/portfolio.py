@@ -162,7 +162,10 @@ def optimize_month(m, w_prev, l2=None, tc=None):
                 if label:
                     print(f"optimize_month: relaxed tolerances {label}")
                 return np.asarray(w.value).ravel(), label, (sector_tol, size_tol, beta_tol)
-        raise RuntimeError("optimize_month: solver failed even after relaxation")
+        raise RuntimeError(
+            "optimize_month: solver failed even after relaxation (base tolerances tried: "
+            f"sector_tol={config.SECTOR_TOL}, size_tol={config.SIZE_TOL}, beta_tol={config.BETA_TOL}, "
+            f"relaxation steps={RELAX_STEPS})")
 
     wv, relax, tols = solve_ladder()
     dust_mask = np.abs(wv) < DUST
@@ -241,7 +244,10 @@ def backtest(signal_df, panel, market, l2=None, tc=None):
         assert m[['beta', 'gics2', 'size_z']].notna().all().all(), \
             f"backtest: NaN in beta/gics2/size_z after inner-merge with panel aux for {mth}"
 
-        w, relax = optimize_month(m[m_cols], w_prev, l2=l2, tc=tc)
+        try:
+            w, relax = optimize_month(m[m_cols], w_prev, l2=l2, tc=tc)
+        except RuntimeError as e:
+            raise RuntimeError(f"backtest: optimize_month infeasible at formation month {mth}: {e}") from e
 
         mi = m.set_index('permno')
         ret = mi['stock_exret']

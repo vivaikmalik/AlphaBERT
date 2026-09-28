@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src import config
+from src import config, portfolio
 from src.portfolio import (
     smooth, optimize_month, compute_month_return, attach_labels, write_submission,
     backtest, missing_return_sensitivity,
@@ -484,6 +484,34 @@ def test_backtest_raises_if_holding_month_missing_from_market():
     market = pd.DataFrame({'rf_m': [], 'sp500_ret': [], 'sp500_exret': []},
                            index=pd.DatetimeIndex([], name='eom'))
     with pytest.raises(ValueError):
+        backtest(signal_df, panel, market)
+
+
+def test_backtest_error_names_formation_month_on_infeasible_optimize_month(monkeypatch):
+    """When optimize_month raises RuntimeError (genuine infeasibility under the neutrality
+    ladder), backtest must re-raise a RuntimeError whose message names the formation month
+    that failed -- crucial for diagnosing which ablation signal/month broke, not just that
+    something did."""
+    n_stocks = 50
+    permnos = np.arange(1, n_stocks + 1)
+    mth = pd.Timestamp('2021-01-31')
+    holding_month = mth + pd.offsets.MonthEnd(1)
+    rng = np.random.default_rng(1)
+    signal_df = pd.DataFrame({'permno': permnos, 'eom': mth, 'signal': rng.normal(size=n_stocks)})
+    panel = pd.DataFrame({
+        'permno': permnos, 'eom': mth, 'beta': 1.0, 'gics2': '10', 'size_z': 0.0,
+        'ticker': [f'T{p}' for p in permnos], 'company_name': [f'Co {p}' for p in permnos],
+        'stock_exret': 0.0, 'has_filing': rng.integers(0, 2, size=n_stocks),
+    })
+    market = pd.DataFrame({'rf_m': [0.001], 'sp500_ret': [0.01], 'sp500_exret': [0.009]},
+                           index=pd.DatetimeIndex([holding_month], name='eom'))
+
+    def fake_optimize_month(*args, **kwargs):
+        raise RuntimeError("optimize_month: solver failed even after relaxation")
+
+    monkeypatch.setattr(portfolio, 'optimize_month', fake_optimize_month)
+
+    with pytest.raises(RuntimeError, match=str(mth)):
         backtest(signal_df, panel, market)
 
 
