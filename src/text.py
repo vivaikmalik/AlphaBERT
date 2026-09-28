@@ -456,7 +456,7 @@ def build_text_features() -> pd.DataFrame:
     filings = pq.read_table(
         config.FILINGS_PATH, columns=['document_id', 'permno', 'filing_date', 'items']
     ).to_pandas()
-    filings['filing_date'] = pd.to_datetime(filings['filing_date'])
+    filings['filing_date'] = pd.to_datetime(filings['filing_date']).astype('datetime64[ns]')
     filings['eom'] = filings['filing_date'] + pd.offsets.MonthEnd(0)
 
     feat = filings.groupby(['permno', 'eom']).size().rename('n_filings').reset_index()
@@ -486,7 +486,7 @@ def build_text_features() -> pd.DataFrame:
         assert (scores['revision'] == FINBERT_REVISION).all(), (
             f'{scores_path.name} contains rows scored with a FinBERT revision other than {FINBERT_REVISION}'
         )
-        scores['filing_date'] = pd.to_datetime(scores['filing_date'])
+        scores['filing_date'] = pd.to_datetime(scores['filing_date']).astype('datetime64[ns]')
         scores['eom'] = scores['filing_date'] + pd.offsets.MonthEnd(0)
         scores['tone'] = scores['fb_pos'] - scores['fb_neg']
         tone = scores.groupby(['permno', 'eom']).agg(

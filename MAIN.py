@@ -77,6 +77,9 @@ def main():
     preds_path = config.CACHE_DIR / 'preds.parquet'
     if args.reuse_preds and preds_path.exists():
         preds = pd.read_parquet(preds_path)
+        for c in ('eom', 'target_month'):
+            if c in preds.columns:
+                preds[c] = pd.to_datetime(preds[c]).astype('datetime64[ns]')
         missing = set(models.PRED_COLS) - set(preds.columns)
         models_path = Path(models.__file__)
         if missing:

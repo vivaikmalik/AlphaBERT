@@ -15,7 +15,7 @@ def load_chars(columns=None) -> pd.DataFrame:
     df = pd.read_parquet(config.CHARS_PATH, columns=columns)
     for c in ('eom', 'date'):
         if c in df.columns:
-            df[c] = pd.to_datetime(df[c])
+            df[c] = pd.to_datetime(df[c]).astype('datetime64[ns]')
     return df
 
 
@@ -88,7 +88,11 @@ def _build(raw: pd.DataFrame) -> pd.DataFrame:
 def build_panel() -> pd.DataFrame:
     cache_path = config.CACHE_DIR / 'panel.parquet'
     if cache_path.exists():
-        return pd.read_parquet(cache_path)
+        cached = pd.read_parquet(cache_path)
+        for c in ('eom', 'target_month', 'date'):
+            if c in cached.columns:
+                cached[c] = pd.to_datetime(cached[c]).astype('datetime64[ns]')
+        return cached
 
     chars = config.load_char_list()
     id_cols = ['permno', 'eom', 'date', 'prc', 'me', 'gics', 'beta_60m',
@@ -200,8 +204,12 @@ def load_market() -> pd.DataFrame:
     if not (tb3ms_path.exists() and sp500_path.exists()):
         _download_market_data(tb3ms_path, sp500_path)
 
-    tb = pd.read_csv(tb3ms_path, parse_dates=['eom']).set_index('eom')
-    sp = pd.read_csv(sp500_path, parse_dates=['eom']).set_index('eom')
+    tb = pd.read_csv(tb3ms_path, parse_dates=['eom'])
+    tb['eom'] = tb['eom'].astype('datetime64[ns]')
+    tb = tb.set_index('eom')
+    sp = pd.read_csv(sp500_path, parse_dates=['eom'])
+    sp['eom'] = sp['eom'].astype('datetime64[ns]')
+    sp = sp.set_index('eom')
     df = tb.join(sp, how='inner').sort_index()
     # single place the in-progress current month is dropped: FRED/yfinance can carry a partial
     # bar for it, whether or not an already-cached csv happens to include it.

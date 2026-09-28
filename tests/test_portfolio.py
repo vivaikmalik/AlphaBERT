@@ -522,6 +522,39 @@ def test_attach_labels_never_uses_future_dates():
     assert out.loc[3, 'ticker'] == 'UNLABELED'
 
 
+def test_attach_labels_mixed_datetime_resolution():
+    """merge_asof (via _asof_fill) requires identical merge-key dtypes; on newer pandas builds
+    a holdings frame and a label source can each carry a different, non-ns datetime resolution
+    (e.g. one parquet/csv round-trip reads back as datetime64[ms], another as datetime64[s]).
+    attach_labels must not crash and must still resolve labels correctly."""
+    holdings = pd.DataFrame({
+        'month': pd.to_datetime(['2021-07-31']),
+        'eom': pd.to_datetime(['2021-06-30']).astype('datetime64[ms]'),
+        'permno': [1],
+        'weight': [0.01],
+        'ticker': [None],
+        'company_name': [None],
+        'label_source': [None],
+    })
+    label_panel = pd.DataFrame({
+        'permno': [1],
+        'eom': pd.to_datetime(['2021-05-31']).astype('datetime64[s]'),
+        'ticker': ['OLD'],
+        'company_name': ['Old Co'],
+    })
+    filing_labels = pd.DataFrame({
+        'permno': pd.Series([], dtype='int64'),
+        'filing_date': pd.Series([], dtype='datetime64[s]'),
+        'ticker': pd.Series([], dtype='object'),
+        'company_name': pd.Series([], dtype='object'),
+    })
+
+    out = attach_labels(holdings, label_panel, filing_labels).set_index('permno')
+
+    assert out.loc[1, 'ticker'] == 'OLD'
+    assert out.loc[1, 'label_source'] == 'raw_panel'
+
+
 # ---------------------------------------------------------- write_submission
 def test_write_submission_format_and_rounding(tmp_path, monkeypatch):
     monkeypatch.setattr(config, 'SUB_DIR', tmp_path)

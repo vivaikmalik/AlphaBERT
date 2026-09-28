@@ -328,9 +328,9 @@ def calibrate(signal_df, panel, market, target_names_per_side=150, target_turnov
 # ---------------------------------------------------------------- labels
 def load_label_sources():
     label_panel = pd.read_parquet(config.CHARS_PATH, columns=['permno', 'eom', 'ticker', 'company_name'])
-    label_panel['eom'] = pd.to_datetime(label_panel['eom'])
+    label_panel['eom'] = pd.to_datetime(label_panel['eom']).astype('datetime64[ns]')
     filing_labels = pd.read_parquet(config.FILINGS_PATH, columns=['permno', 'filing_date', 'ticker', 'company_name'])
-    filing_labels['filing_date'] = pd.to_datetime(filing_labels['filing_date'])
+    filing_labels['filing_date'] = pd.to_datetime(filing_labels['filing_date']).astype('datetime64[ns]')
     return label_panel, filing_labels
 
 
@@ -341,6 +341,10 @@ def _asof_fill(missing, source, date_col):
     src = source.dropna(subset=['ticker', 'company_name']).sort_values(date_col)
     src = src.rename(columns={date_col: 'eom'})[['permno', 'eom', 'ticker', 'company_name']]
     left = missing.sort_values('eom')
+    # belt-and-braces: merge_asof requires identical key dtypes, and 'eom' can arrive at ns, us,
+    # ms or s resolution depending on which pandas build wrote/read the upstream parquet/csv.
+    left = left.assign(eom=left['eom'].astype('datetime64[ns]'))
+    src = src.assign(eom=src['eom'].astype('datetime64[ns]'))
     merged = pd.merge_asof(left, src, on='eom', by='permno', direction='backward')
     return merged.dropna(subset=['ticker', 'company_name']).set_index('_idx')
 
