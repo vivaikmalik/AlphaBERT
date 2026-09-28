@@ -5,7 +5,7 @@ import pytest
 from src import config, portfolio
 from src.portfolio import (
     smooth, optimize_month, compute_month_return, attach_labels, write_submission,
-    backtest, missing_return_sensitivity,
+    backtest, missing_return_sensitivity, _dust_and_rescale,
 )
 
 SECTORS = [f"{10 + 5 * i}" for i in range(11)]  # 11 synthetic GICS2 codes
@@ -73,6 +73,27 @@ def test_optimize_month_constraints(months):
         w, relax = optimize_month(m, w_prev)
         _check_month(w, relax, m)
         w_prev = w
+
+
+def test_dust_and_rescale_clips_post_rescale_overshoot():
+    """A leg where one name sits at MAX_WEIGHT + 4e-7 after the raw rescale (the
+    rescale ratio can nudge a near-cap name just over it, e.g. to 1.500004% > 1.5%)
+    must come out with max |w| exactly <= MAX_WEIGHT, and the leg must still sum to
+    exactly 1 (within 1e-12) after the clipped excess is redistributed."""
+    cap = config.MAX_WEIGHT
+    n = 120
+    wv = np.full(n, 1.0 / n)
+    wv[0] = cap + 4e-7
+    # renormalize the rest so the raw (pre-fix) leg sum is exactly 1, mimicking what
+    # optimize_month's solver output looks like just before _dust_and_rescale runs
+    wv[1:] = (1.0 - wv[0]) / (n - 1)
+    is_long = np.ones(n, dtype=bool)
+    is_short = np.zeros(n, dtype=bool)
+
+    out = _dust_and_rescale(wv, is_long, is_short)
+
+    assert np.abs(out).max() <= cap + 1e-12
+    assert out[is_long].sum() == pytest.approx(1.0, abs=1e-12)
 
 
 def test_turnover_penalty_reduces_turnover(months):

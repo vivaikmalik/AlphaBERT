@@ -56,13 +56,35 @@ def _solve(prob):
 
 
 def _dust_and_rescale(wv, is_long, is_short):
-    """Zero-out dust (|w| < DUST), then rescale each leg back to exactly +1/-1."""
+    """Zero-out dust (|w| < DUST), then rescale each leg back to exactly +1/-1. The
+    rescale can nudge a name already at/near MAX_WEIGHT slightly past it (the solver
+    only enforces the cap up to its own tolerance, and rescaling by a ratio > 1 can
+    push it over), so each leg is then clipped to <= MAX_WEIGHT, with the clipped
+    excess redistributed proportionally across that leg's other names (looped since
+    a redistribution can itself push a different name over), leaving the leg sum at
+    exactly +1/-1 (up to float epsilon)."""
     wv = wv.copy()
     wv[np.abs(wv) < DUST] = 0.0
+    cap = config.MAX_WEIGHT
     for mask, target in ((is_long, 1.0), (is_short, -1.0)):
         idx = np.where(mask)[0]
-        if idx.size and wv[idx].sum() != 0:
-            wv[idx] = wv[idx] * (target / wv[idx].sum())
+        if not idx.size or wv[idx].sum() == 0:
+            continue
+        wv[idx] = wv[idx] * (target / wv[idx].sum())
+        sign = np.sign(target)
+        m = wv[idx] * sign  # magnitudes, all >= 0, sum == 1
+        for _ in range(10):
+            over = m > cap
+            if not over.any():
+                break
+            excess = float((m[over] - cap).sum())
+            m[over] = cap
+            under = ~over
+            room = m[under].sum()
+            if room <= 0:
+                break
+            m[under] += excess * (m[under] / room)
+        wv[idx] = sign * m
     return wv
 
 
@@ -87,7 +109,7 @@ def _check_constraints(w, is_long, is_short, beta, size_z, groups, cap,
     never relaxed, so they stay checked against fixed constants."""
     assert abs(w[is_long].sum() - 1.0) <= tol, "long leg does not sum to 1"
     assert abs(w[is_short].sum() + 1.0) <= tol, "short leg does not sum to -1"
-    assert np.abs(w).max() <= cap + tol, "MAX_WEIGHT breached"
+    assert np.abs(w).max() <= cap + 1e-12, "MAX_WEIGHT breached"
     assert abs(beta @ w) <= beta_tol + tol, "beta exposure breached"
     assert abs(size_z @ w) <= size_tol + tol, "size exposure breached"
     for name, mask in groups.items():
