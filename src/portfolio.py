@@ -99,14 +99,17 @@ def _tol_groups(sector, filer):
 
 
 def _check_constraints(w, is_long, is_short, beta, size_z, groups, cap,
-                        sector_tol, size_tol, beta_tol, tol=1e-5):
+                        sector_tol, size_tol, beta_tol, tol=1e-5, check_n_names=True):
     """One assert block for every optimize_month constraint, at `tol`. `sector_tol`/
     `size_tol`/`beta_tol` are the EFFECTIVE tolerances actually used for the solve that
     produced `w` (a RELAX_STEPS ladder step may have widened them beyond the config base
     values) -- checking against the fixed config constants regardless of which step solved
     would fire spuriously whenever solve_ladder needed to relax. Legs summing to +-1, the
     MAX_WEIGHT cap, and the 100..500 name count are competition rules at fixed values and are
-    never relaxed, so they stay checked against fixed constants."""
+    never relaxed, so they stay checked against fixed constants. `check_n_names=False` (used by
+    optimize_month's dust/rescale checks that run BEFORE the A15 cardinality guard) skips the
+    upper-bound side of the 100..500 name count, which the guard is responsible for fixing;
+    the final check after the guard always uses the default check_n_names=True."""
     assert abs(w[is_long].sum() - 1.0) <= tol, "long leg does not sum to 1"
     assert abs(w[is_short].sum() + 1.0) <= tol, "short leg does not sum to -1"
     assert np.abs(w).max() <= cap + 1e-12, "MAX_WEIGHT breached"
@@ -114,8 +117,9 @@ def _check_constraints(w, is_long, is_short, beta, size_z, groups, cap,
     assert abs(size_z @ w) <= size_tol + tol, "size exposure breached"
     for name, mask in groups.items():
         assert abs(w[mask].sum()) <= sector_tol + tol, f"{name} exposure breached"
-    n_names = int((w != 0).sum())
-    assert 100 <= n_names <= 500, f"n_names={n_names} out of [100,500]"
+    if check_n_names:
+        n_names = int((w != 0).sum())
+        assert 100 <= n_names <= 500, f"n_names={n_names} out of [100,500]"
 
 
 def optimize_month(m, w_prev, l2=None, tc=None):
@@ -193,7 +197,10 @@ def optimize_month(m, w_prev, l2=None, tc=None):
     dust_mask = np.abs(wv) < DUST
     wv = _dust_and_rescale(wv, is_long, is_short)
     try:
-        _check_constraints(wv, is_long, is_short, beta, size_z, groups, cap, *tols)
+        # check_n_names=False: the >500 side of the count is the A15 cardinality guard's job
+        # (below), not this dust/rescale check's -- with N_CAND=350 a solve can legitimately
+        # come back with up to 2*N_CAND=700 nonzero names before the guard trims it.
+        _check_constraints(wv, is_long, is_short, beta, size_z, groups, cap, *tols, check_n_names=False)
     except AssertionError:
         # rescaling the dusted solution broke a constraint: re-solve once with
         # the dusted names fixed at exactly 0, then dust/rescale again. Check against
@@ -202,6 +209,40 @@ def optimize_month(m, w_prev, l2=None, tc=None):
         wv, relax2, tols = solve_ladder(fixed_zero=dust_mask)
         relax = ','.join(x for x in (relax, relax2) if x)
         wv = _dust_and_rescale(wv, is_long, is_short)
+        _check_constraints(wv, is_long, is_short, beta, size_z, groups, cap, *tols, check_n_names=False)
+
+    # A15 cardinality guard: with N_CAND=350 per side the solve can legitimately return more
+    # than the competition's 500-name cap (up to 2*N_CAND=700 nonzero names). If so, keep each
+    # leg's 250 largest-|w| names, fix everything else to exactly 0 via the existing fixed_zero
+    # mechanism, and re-solve once, then dust/rescale/check as usual.
+    n_names = int((wv != 0).sum())
+    if n_names > 500:
+        keep = np.zeros(n, dtype=bool)
+        for mask in (is_long, is_short):
+            idx = np.where(mask & (wv != 0))[0]
+            top = idx[np.argsort(-np.abs(wv[idx]))[:250]] if idx.size > 250 else idx
+            keep[top] = True
+        wv, relax3, tols = solve_ladder(fixed_zero=~keep)
+        relax = ','.join(x for x in (relax, relax3, 'cardinality') if x)
+        wv_before_dust = wv
+        wv = _dust_and_rescale(wv, is_long, is_short)
+        try:
+            # final check, always including the 100..500 name count (default check_n_names=True):
+            # this is the guard's post-guard check.
+            _check_constraints(wv, is_long, is_short, beta, size_z, groups, cap, *tols)
+        except AssertionError:
+            # same one-retry pattern as the pre-guard check above: rescaling the dusted
+            # post-guard solution broke a constraint, so re-solve once with both the names the
+            # guard dropped AND this solve's dusted names fixed at exactly 0, then
+            # dust/rescale/check again (unwrapped this time).
+            wv, relax4, tols = solve_ladder(fixed_zero=~keep | (np.abs(wv_before_dust) < DUST))
+            relax = ','.join(x for x in (relax, relax4) if x)
+            wv = _dust_and_rescale(wv, is_long, is_short)
+            _check_constraints(wv, is_long, is_short, beta, size_z, groups, cap, *tols)
+    else:
+        # final check, always including the 100..500 name count (default check_n_names=True): the
+        # guard didn't run, so n_names was already <=500 (only the >=100 side and a re-check of
+        # the other constraints remain to be confirmed here).
         _check_constraints(wv, is_long, is_short, beta, size_z, groups, cap, *tols)
 
     weights = pd.Series(wv, index=names)

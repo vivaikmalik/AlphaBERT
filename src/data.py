@@ -52,6 +52,8 @@ def _build(raw: pd.DataFrame) -> pd.DataFrame:
     prc_raw = df['prc'].copy()
     dolvol_raw = df['dolvol_126d'].copy()
     beta_raw = df['beta_60m'].copy()
+    betabab_raw = df['betabab_1260d'].copy()
+    ivol252_raw = df['ivol_capm_252d'].copy()
 
     # miss_ flags: selected on universe rows with eom <= cutoff, applied to all universe rows
     cutoff_rows = df.loc[df['eom'] <= config.MISS_FLAG_CUTOFF, chars]
@@ -64,9 +66,15 @@ def _build(raw: pd.DataFrame) -> pd.DataFrame:
 
     # aux (not features)
     gics2 = pd.Series(np.where(df['gics'].isna(), 'NA', df['gics'].astype(str).str.slice(0, 2)), index=df.index)
-    beta = pd.Series(
-        np.where(beta_raw.isna(), 1.0, (1 - config.BETA_SHRINK) * beta_raw + config.BETA_SHRINK * 1.0),
-        index=df.index)
+    # A15 (beta model fix, docs/SPEC.md section 10): fractional-parity Frazzini-Pedersen (2014)
+    # "betting against beta" beta (betabab_1260d; correlation from ~5y returns, vol from ~1y),
+    # falling back to a Blume-adjusted beta_60m, then to BETA_MISSING when both are missing;
+    # blended with the within-eom percentile of 252-day CAPM idio vol.
+    b1 = ((config.BETA_FP_W * betabab_raw.clip(-1, 4) + config.BETA_FP_C)
+          .fillna(0.67 * beta_raw + 0.33)
+          .fillna(config.BETA_MISSING))
+    ivp = ivol252_raw.groupby(df['eom']).rank(pct=True).fillna(0.5)
+    beta = config.BETA_INTERCEPT + config.BETA_SLOPE * b1 + config.BETA_IVOL * ivp
     log_me = np.log(df['me'])
     size_z = log_me.groupby(df['eom']).transform(lambda s: (s - s.mean()) / s.std())
     # NOTE deviation from literal SPEC wording: 'prc' and 'dolvol_126d' are both feature-char names

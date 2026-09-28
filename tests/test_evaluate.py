@@ -186,6 +186,29 @@ def test_exposure_table_relax_frequency_and_filer_net():
     assert exp['filer_net_max'] == pytest.approx(0.03)
 
 
+# ---------------------------------------------------------------- exposure_table A15 cardinality guard
+def test_exposure_table_cardinality_stripped_from_relax_share():
+    idx = pd.date_range('2021-01-31', periods=4, freq='ME')
+    returns = pd.DataFrame({
+        'turnover': [1.0, 0.2, 0.4, 0.6], 'first_month': [True, False, False, False],
+        'n_long': [10] * 4, 'n_short': [10] * 4,
+        'gross': [2.0] * 4, 'net': [0.0] * 4, 'beta_exante': [0.0] * 4,
+        'missing_ret_weight': [0.0] * 4,
+        # month 0: cardinality guard only fired, no tolerance relaxation.
+        # month 1: tolerance relaxation AND the cardinality guard both fired.
+        # month 2: tolerance relaxation only. month 3: neither.
+        'relax': ['cardinality', 'sector_tol_x2,cardinality', 'sector_tol_x2', ''],
+        'filer_net': [0.0] * 4,
+    }, index=idx)
+    holdings = pd.DataFrame({'month': idx.repeat(2), 'weight': [0.1, -0.1] * 4})
+    exp = ev.exposure_table(returns, holdings)
+    # relax_share/relax_count are tolerance-relaxation-only: only months 1 and 2 count, not month 0.
+    assert exp['relax_share'] == pytest.approx(0.5)
+    assert exp['relax_count_sector_tol_x2'] == 2
+    # cardinality_guard_share counts months 0 and 1, regardless of tolerance relaxation.
+    assert exp['cardinality_guard_share'] == pytest.approx(0.5)
+
+
 # ---------------------------------------------------------------- drawdown incl. starting capital
 def test_first_month_drawdown_includes_starting_capital():
     # Without treating starting capital ($1) as a peak, cummax() of wealth alone starts at

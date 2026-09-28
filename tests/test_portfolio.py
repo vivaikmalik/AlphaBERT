@@ -96,6 +96,26 @@ def test_dust_and_rescale_clips_post_rescale_overshoot():
     assert out[is_long].sum() == pytest.approx(1.0, abs=1e-12)
 
 
+def test_optimize_month_cardinality_guard_caps_at_500(rng, permnos, monkeypatch):
+    """A15: N_CAND=350 per side means a solve can legitimately want up to 2*N_CAND=700 nonzero
+    names before any cardinality fix -- more than the competition's 500-name maximum. Force that
+    with a large L2 penalty (which pushes the optimizer toward spreading weight thinly across as
+    many candidates as it can, rather than concentrating in a few) and confirm optimize_month's
+    guard (src/portfolio.py optimize_month, 'A15 cardinality guard') brings it back to <=500,
+    <=250 per leg, tagged 'cardinality' in relax, with all the usual constraints still holding."""
+    monkeypatch.setattr(config, 'L2_PENALTY', 10_000.0)
+    m = make_month(rng, permnos)
+
+    w, relax = optimize_month(m, pd.Series(dtype=float))
+
+    assert 'cardinality' in relax
+    n_names = w.shape[0]
+    assert n_names <= 500
+    assert (w > 0).sum() <= 250
+    assert (w < 0).sum() <= 250
+    _check_month(w, relax, m)
+
+
 def test_turnover_penalty_reduces_turnover(months):
     m1, m2 = months[0], months[1]
     w1, _ = optimize_month(m1, pd.Series(dtype=float))
@@ -224,7 +244,11 @@ def test_optimize_month_sector_lopsided_demeaning_fixes_feasibility():
     cap = config.MAX_WEIGHT
     n_cand = config.N_CAND
 
-    n_shift = 200  # S1/S2 population; each below n_cand so it alone can't fill a whole leg
+    # S1/S2 population: below n_cand (so each alone can't fill a whole leg) but close enough to
+    # it that only a small slice of the raw short/long candidates can come from outside S1/S2 --
+    # keeps the same ~50-name margin this test was originally built with at N_CAND=250/n_shift=200,
+    # so it still holds at any N_CAND (A15 raised N_CAND to 350).
+    n_shift = n_cand - 50
     n_filler_sectors = 20
     n_filler_each = 40
     n = 2 * n_shift + n_filler_sectors * n_filler_each
@@ -267,8 +291,12 @@ def test_optimize_month_sector_lopsided_demeaning_fixes_feasibility():
     # objective (A14): S1/S2's additive shift is removed, leaving only noise-scale
     # within-sector deviations -- comparable to the filler sectors' -- so candidates (and
     # therefore sector exposures) come out balanced: feasible at base or one relax step.
+    # (A15: N_CAND=350 makes a >500-name solve routine here too, so 'cardinality' can appear
+    # in `relax` alongside/instead of 'sector x2' -- _check_month's own asserts, incl. n_names
+    # <= 500, are the real feasibility check; this just confirms no OTHER relaxation was needed.)
     w, relax = optimize_month(m_df, pd.Series(dtype=float))
-    assert relax in ('', 'sector x2')
+    tags = set(relax.split(',')) - {''}
+    assert tags - {'sector x2', 'cardinality'} == set(), relax
     _check_month(w, relax, m_df)
 
 

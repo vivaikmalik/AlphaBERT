@@ -99,3 +99,14 @@ blend WITH text vs. WITHOUT text, by test year 2021..2026, was 0.016/0.069/0.030
 vs. 0.015/0.070/0.032/0.053/0.055/0.047 -- text-as-item-counts is neutral on validation. The text
 specialist stays in the pre-registered six-specialist design; its FinBERT tone features are the
 untested part.
+
+## 2026-09-28 -- A15 (post-hoc, disclosed): beta model
+Test-period realized beta was -0.33 (NW SE 0.16) and was seen before this decision. The fix rests
+on validation-only evidence: the 2019-2020 validation backtest showed realized beta -0.43 (NW SE
+0.19); cause: the optimizer piled into shorts with missing beta_60m imputed as 1.0 (46% of short
+candidates, 70% of short weight; pre-2019 forward beta of such names 1.25; high-ivol shorts
+understated). New estimator (formula), coefficients fitted on 2015-2017 formation months only;
+N_CAND 250->350 because with 250 the short candidates were too beta-lopsided (validation beta
+-0.23 vs -0.07 at 350); cardinality guard keeps <=500 names. Validation: beta -0.07 (NW SE 0.14),
+2019 +0.03 / 2020 -0.10. Estimators rejected on validation: Dimson 21d blends (-0.43), missing->1.25
+only (-0.32), FP blend B1 (-0.24/-0.16), vol-neutral constraint (infeasible at 250; large IR cost).

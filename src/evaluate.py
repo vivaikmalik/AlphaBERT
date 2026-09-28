@@ -185,10 +185,18 @@ def exposure_table(returns: pd.DataFrame, holdings: pd.DataFrame) -> pd.Series:
     top10 = holdings.groupby('month')['weight'].apply(top10_share)
 
     # A10 diagnostics: how often optimize_month had to relax a tolerance, and the filer-net
-    # exposure the SECTOR_TOL-as-a-sector constraint is meant to keep small.
-    relaxed = returns['relax'].astype(str) != ''
-    relax_counts = returns.loc[relaxed, 'relax'].value_counts()
-    relax_stats = {'relax_share': relaxed.mean()}
+    # exposure the SECTOR_TOL-as-a-sector constraint is meant to keep small. The A15 cardinality
+    # guard appends a 'cardinality' token to `relax` when it fires (src/portfolio.py); that's a
+    # separate mechanism from the RELAX_STEPS tolerance ladder, so it's stripped out here and
+    # reported on its own (cardinality_guard_share) rather than counted toward relax_share/
+    # relax_count_*, which stay tolerance-relaxation-only.
+    relax_raw = returns['relax'].astype(str)
+    cardinality_guard = relax_raw.str.contains('cardinality')
+    relax_tol = relax_raw.apply(
+        lambda s: ','.join(tok for tok in s.split(',') if tok and tok != 'cardinality'))
+    relaxed = relax_tol != ''
+    relax_counts = relax_tol.loc[relaxed].value_counts()
+    relax_stats = {'relax_share': relaxed.mean(), 'cardinality_guard_share': cardinality_guard.mean()}
     relax_stats.update({f'relax_count_{label}': int(n) for label, n in relax_counts.items()})
 
     return pd.Series({

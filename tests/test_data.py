@@ -221,23 +221,42 @@ def test_miss_flags_use_only_cutoff_rows(tmp_path, monkeypatch):
     assert f'miss_{target_char}' not in panel.columns
 
 
-def test_beta_shrink_and_gics2_na(tmp_path, monkeypatch):
-    """beta shrink formula (missing beta_60m -> exactly 1.0; present -> shrink formula on RAW
-    beta_60m) and gics2 'NA' fill for missing gics."""
+def test_beta_a15_formula_and_gics2_na(tmp_path, monkeypatch):
+    """A15 beta formula: b1 = BETA_FP_W*clip(betabab_1260d,-1,4) + BETA_FP_C (incl. the clip
+    biting on out-of-range betabab), falling back to a Blume-adjusted beta_60m (0.67*beta_60m +
+    0.33) when betabab_1260d is missing, and to BETA_MISSING when both are missing; blended with
+    ivp = within-eom percentile rank of ivol_capm_252d (0.5 when ivol_capm_252d is itself missing)
+    as beta = BETA_INTERCEPT + BETA_SLOPE*b1 + BETA_IVOL*ivp. Also covers gics2 'NA' fill for
+    missing gics (unrelated to the beta formula, kept from the pre-A15 version of this test)."""
     chars = config.load_char_list()
     rng = np.random.default_rng(4)
     eom = pd.Timestamp('2020-01-31')
-    n_permnos = 10
+    # (betabab_1260d, beta_60m, ivol_capm_252d) per permno -- ivol values are strictly increasing
+    # so each row's percentile rank among the 7 non-null ivol values is unambiguous (rank/7).
+    specs = [
+        (1.0, 1.2, 0.01),    # p0: betabab present, in-range -> b1 = 0.6*1.0 + 0.4
+        (10.0, 1.2, 0.02),   # p1: betabab present, clipped from 10.0 down to 4
+        (-5.0, 1.2, 0.03),   # p2: betabab present, clipped from -5.0 up to -1
+        (np.nan, 1.5, 0.04), # p3: betabab missing -> Blume fallback on beta_60m
+        (np.nan, np.nan, 0.05),  # p4: both missing -> BETA_MISSING
+        (1.0, 1.2, 0.06),    # p5: gics missing (separate check), betabab present
+        (2.0, 1.2, 0.07),    # p6: betabab present, in-range
+        (0.0, 1.2, np.nan),  # p7: ivol_capm_252d missing -> ivp fills to 0.5
+    ]
     rows = []
-    for p in range(n_permnos):
+    for p, (betabab, beta60m, ivol252) in enumerate(specs):
         row = {c: rng.normal(0, 1) for c in chars}
         # id/aux columns set AFTER the chars fill: some chars share names with id/aux columns
-        # ('prc', 'dolvol_126d', 'beta_60m') and must not be clobbered by the random fill above.
+        # ('prc', 'dolvol_126d', 'beta_60m', 'betabab_1260d', 'ivol_capm_252d') and must not be
+        # clobbered by the random fill above.
         row.update({
             'permno': 4000 + p, 'eom': eom, 'date': eom,
-            'prc': 20.0, 'me': 1000.0 * (p + 1),
+            # constant 'me' (not scaled by p): universe_mask's within-eom ME_CUTOFF_PCTILE=0.20
+            # quantile filter would otherwise drop the bottom ~2 of 8 rows at a linearly-spaced
+            # 'me', and every one of these 8 rows needs to survive into the panel.
+            'prc': 20.0, 'me': 1_000_000.0,
             'gics': None if p == 5 else f'{10 + p}101010',
-            'beta_60m': np.nan if p == 6 else 1.0 + 0.1 * p,
+            'beta_60m': beta60m, 'betabab_1260d': betabab, 'ivol_capm_252d': ivol252,
             'dolvol_126d': 1000.0, 'size_grp': 'mega',
             'ticker': f'T{p}', 'company_name': f'C{p}',
             'ret_exc_lead1m': rng.normal(0, 0.05),
@@ -252,16 +271,80 @@ def test_beta_shrink_and_gics2_na(tmp_path, monkeypatch):
     monkeypatch.setattr(config, 'CHARS_PATH', chars_path)
     monkeypatch.setattr(config, 'CACHE_DIR', cache_dir)
 
-    panel = build_panel()
-    p5 = panel.loc[panel['permno'] == 4005].iloc[0]  # gics missing, beta_60m = 1.5 present
-    p6 = panel.loc[panel['permno'] == 4006].iloc[0]  # gics present, beta_60m missing
+    panel = build_panel().set_index('permno')
 
-    assert p5['gics2'] == 'NA'
-    expected_beta_p5 = (1 - config.BETA_SHRINK) * 1.5 + config.BETA_SHRINK * 1.0
-    assert p5['beta'] == pytest.approx(expected_beta_p5)
+    def expected_beta(betabab, beta60m, ivp):
+        if not np.isnan(betabab):
+            b1 = config.BETA_FP_W * np.clip(betabab, -1, 4) + config.BETA_FP_C
+        elif not np.isnan(beta60m):
+            b1 = 0.67 * beta60m + 0.33
+        else:
+            b1 = config.BETA_MISSING
+        return config.BETA_INTERCEPT + config.BETA_SLOPE * b1 + config.BETA_IVOL * ivp
 
-    assert p6['beta'] == pytest.approx(1.0)
-    assert p6['gics2'] == '16'
+    ivp_by_p = {p: rank / 7 for rank, p in enumerate(range(7), start=1)}  # p0..p6 non-null, rank/7
+    ivp_by_p[7] = 0.5  # p7: ivol_capm_252d missing -> fillna(0.5)
+
+    for p, (betabab, beta60m, ivol252) in enumerate(specs):
+        row = panel.loc[4000 + p]
+        exp = expected_beta(betabab, beta60m, ivp_by_p[p])
+        assert row['beta'] == pytest.approx(exp), f"p{p}: beta mismatch"
+
+    assert panel.loc[4005, 'gics2'] == 'NA'
+    assert panel.loc[4006, 'gics2'] == '16'
+
+
+def test_ivp_ranks_within_eom_separately(tmp_path, monkeypatch):
+    """ivp (the ivol_capm_252d percentile blended into 'beta', A15) is a within-eom rank
+    (`.groupby(df['eom']).rank(pct=True)`), not a global rank -- two eoms whose ivol_capm_252d
+    values sit on completely different scales must still produce the SAME ivp (and hence the
+    same 'beta', since betabab_1260d/b1 is held constant here) at matching within-eom rank
+    positions. A global rank would instead let eom2's uniformly-larger ivol scale dominate and
+    push its ivp values above eom1's at every rank position."""
+    chars = config.load_char_list()
+    rng = np.random.default_rng(7)
+    eom1 = pd.Timestamp('2020-01-31')
+    eom2 = pd.Timestamp('2020-02-29')
+    # same 4 within-eom ivol ranks in both months, but on wildly different absolute scales
+    # (eom1: ~0.01-0.04, eom2: ~100-400) -- same betabab_1260d (b1 constant) in both months, so
+    # any beta difference at a matching rank position can only come from ivp.
+    ivol_by_eom = {eom1: [0.01, 0.02, 0.03, 0.04], eom2: [100.0, 200.0, 300.0, 400.0]}
+    betabab = 1.0
+
+    rows = []
+    permno = 5000
+    for eom, ivols in ivol_by_eom.items():
+        for rank_pos, ivol252 in enumerate(ivols):
+            row = {c: rng.normal(0, 1) for c in chars}
+            row.update({
+                'permno': permno, 'eom': eom, 'date': eom,
+                'prc': 20.0, 'me': 1_000_000.0,
+                'gics': f'{10 + rank_pos}101010',
+                'beta_60m': 1.2, 'betabab_1260d': betabab, 'ivol_capm_252d': ivol252,
+                'dolvol_126d': 1000.0, 'size_grp': 'mega',
+                'ticker': f'T{permno}', 'company_name': f'C{permno}',
+                'ret_exc_lead1m': rng.normal(0, 0.05),
+            })
+            rows.append(row)
+            permno += 1
+    raw = pd.DataFrame(rows)
+
+    chars_path = tmp_path / 'chars.parquet'
+    raw.to_parquet(chars_path)
+    cache_dir = tmp_path / 'cache'
+    cache_dir.mkdir()
+    monkeypatch.setattr(config, 'CHARS_PATH', chars_path)
+    monkeypatch.setattr(config, 'CACHE_DIR', cache_dir)
+
+    panel = build_panel().set_index('permno')
+
+    beta_eom1 = panel.loc[5000:5003, 'beta'].to_numpy()
+    beta_eom2 = panel.loc[5004:5007, 'beta'].to_numpy()
+    # matching rank positions (both strictly increasing ivol -> rank 1..4 of 4 in each eom)
+    # must give identical beta despite the 10,000x difference in ivol scale between the eoms.
+    assert beta_eom1 == pytest.approx(beta_eom2)
+    # sanity: ivp actually varies within an eom (beta isn't just constant regardless of ivol).
+    assert len(set(np.round(beta_eom1, 8))) == 4
 
 
 # ---------------------------------------------------------------------------
