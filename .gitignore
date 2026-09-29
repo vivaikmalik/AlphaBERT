@@ -33,3 +33,7 @@ outputs/
 ~$*
 .vscode/
 .idea/
+
+# Spark result copies (caches are large; only results/ is versioned)
+outputs_dgx*/
+*.npy

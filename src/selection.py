@@ -102,7 +102,7 @@ def _lasso_stability(months, X, yv, n_features):
         if len(idx) > LASSO_ROW_CAP:
             idx = rng.choice(idx, size=LASSO_ROW_CAP, replace=False)
         Xs, ys = X[idx], yv[idx]
-        model = LassoCV(cv=3, n_alphas=20, max_iter=2000, random_state=config.SEED)
+        model = LassoCV(cv=3, alphas=20, max_iter=2000, random_state=config.SEED)
         model.fit(Xs, ys)
         hits += np.abs(model.coef_) > 1e-10
     return hits / reps

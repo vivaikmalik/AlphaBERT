@@ -1,0 +1,2 @@
+signal,error
+pred_ridge,"backtest: optimize_month infeasible at formation month 2023-06-30 00:00:00: optimize_month: solver failed even after relaxation (base tolerances tried: sector_tol=0.03, size_tol=0.05, beta_tol=0.02, relaxation steps=[(1, 1, 1, ''), (2, 1, 1, 'sector x2'), (2, 2, 1, 'sector x2,size x2'), (2, 2, 2, 'sector x2,size x2,beta x2')])"
