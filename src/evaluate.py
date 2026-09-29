@@ -278,6 +278,33 @@ def regime_table(returns: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).T
 
 
+def neutrality_table(returns: pd.DataFrame) -> pd.DataFrame:
+    """The committee's first check: is this book actually market-neutral? One row per metric:
+    full-period beta (OLS + Newey-West SE/t-stat, via alpha_beta), per-calendar-year beta (same,
+    computed on each calendar year's rows only), average ex-ante beta, average/min/max net
+    exposure, and correlation with the S&P. `se`/`t_stat` are populated for the beta rows only."""
+    rows = {}
+    full = alpha_beta(returns, 'total_ret')
+    rows['beta_full_period'] = {'value': full['beta'], 'se': full['beta_se_nw'],
+                                 't_stat': full['beta_t_nw'], 'n_obs': full['n_obs']}
+    for year, sub in returns.groupby(returns.index.year):
+        if len(sub) < 3:
+            continue
+        yb = alpha_beta(sub, 'total_ret')
+        rows[f'beta_{year}'] = {'value': yb['beta'], 'se': yb['beta_se_nw'],
+                                 't_stat': yb['beta_t_nw'], 'n_obs': yb['n_obs']}
+    extra = {
+        'avg_ex_ante_beta': returns['beta_exante'].mean(),
+        'avg_net_exposure': returns['net'].mean(),
+        'min_net_exposure': returns['net'].min(),
+        'max_net_exposure': returns['net'].max(),
+        'corr_sp500': returns['total_ret'].corr(returns['sp500_ret']),
+    }
+    for name, value in extra.items():
+        rows[name] = {'value': value, 'se': np.nan, 't_stat': np.nan, 'n_obs': len(returns)}
+    return pd.DataFrame(rows).T
+
+
 def ablation_table(results: dict) -> pd.DataFrame:
     """Each variant is passed through the same test-window restriction/assert as `returns`."""
     rows = {}
@@ -400,6 +427,19 @@ def plot_contributors(top, bottom):
     _savefig(fig, 'contributors.png')
 
 
+def plot_beta_by_year(neutrality: pd.DataFrame):
+    """Bar chart of per-calendar-year beta vs S&P 500 (NW SE error bars), from neutrality_table's
+    beta_YYYY rows -- the committee's first check, at a glance."""
+    yearly = neutrality[neutrality.index.str.startswith('beta_') & (neutrality.index != 'beta_full_period')]
+    years = [idx.replace('beta_', '') for idx in yearly.index]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(years, yearly['value'], yerr=yearly['se'], color='tab:blue', capsize=4)
+    ax.axhline(0, color='black', lw=0.8)
+    ax.set_ylabel('Beta vs S&P 500')
+    ax.set_title(f'Beta by calendar year, {PERIOD_LABEL}')
+    _savefig(fig, 'beta_by_year.png')
+
+
 def plot_gate_weights(gate_coefs, state):
     series = gate_weight_series(gate_coefs, state)
     _line_plot({c: series[c] for c in series.columns},
@@ -421,7 +461,7 @@ def _headline_stats(returns: pd.DataFrame, perf: pd.DataFrame, ab: dict) -> dict
         'cagr': perf.loc['strategy_gross', 'cagr'], 'max_dd': perf.loc['strategy_gross', 'max_dd'],
         'ir_net': perf.loc['strategy_net', 'ir'],
         'alpha_ann': ab['alpha_ann'], 'alpha_t_nw': ab['alpha_t_nw'],
-        'beta': ab['beta'], 'beta_se_nw': ab['beta_se_nw'],
+        'beta': ab['beta'], 'beta_se_nw': ab['beta_se_nw'], 'beta_t_nw': ab['beta_t_nw'],
         'avg_turnover': _turnover(returns).mean(),
         'avg_n_long': returns['n_long'].mean(), 'avg_n_short': returns['n_short'].mean(),
     }
@@ -436,6 +476,19 @@ def run_evaluation(returns, holdings, panel, gate_coefs=None, state=None, ablati
     holdings = holdings[_window_mask(holdings['month'])]
     config.TABLE_DIR.mkdir(parents=True, exist_ok=True)
     print(IR_FORMULA)
+
+    # neutrality check first -- this is the committee's first question, so it's the first table
+    # computed, written and printed, ahead of performance/exposure/everything else.
+    neutrality = neutrality_table(returns)
+    neutrality.to_csv(config.TABLE_DIR / 'neutrality_table.csv')
+    nf = neutrality.loc['beta_full_period']
+    print('=== NEUTRALITY CHECK (committee first look) ===')
+    print(f"full-period beta={nf['value']:.3f} (NW t-stat={nf['t_stat']:.2f}), "
+          f"avg ex-ante beta={neutrality.loc['avg_ex_ante_beta', 'value']:.3f}, "
+          f"avg net exposure={neutrality.loc['avg_net_exposure', 'value']:.3f} "
+          f"(min={neutrality.loc['min_net_exposure', 'value']:.3f}, "
+          f"max={neutrality.loc['max_net_exposure', 'value']:.3f}), "
+          f"corr(S&P 500)={neutrality.loc['corr_sp500', 'value']:.3f}")
 
     perf = performance_table(returns)
     perf.to_csv(config.TABLE_DIR / 'performance_table.csv')
@@ -472,6 +525,7 @@ def run_evaluation(returns, holdings, panel, gate_coefs=None, state=None, ablati
     plot_rolling_beta(returns)
     plot_return_histogram(returns)
     plot_contributors(top_c, bot_c)
+    plot_beta_by_year(neutrality)
     if gate_coefs is not None and state is not None:
         plot_gate_weights(gate_coefs, state)
 

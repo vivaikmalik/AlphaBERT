@@ -248,6 +248,54 @@ def test_score_texts_scores_empty_text_as_nan():
     np.testing.assert_allclose(out[0], out[2])  # fake model returns the same logits regardless
 
 
+# ---------------------------------------------------------------- embed_texts
+
+def _fake_tok_pad(batch, padding=True, truncation=True, max_length=None, return_tensors='pt'):
+    import torch
+    # fake tokenizer: each text's "length" is its word count (capped at 4 real tokens); pad
+    # shorter texts in the batch with attention_mask=0 so mean pooling has real padding to ignore.
+    lens = [min(len(t.split()), 4) for t in batch]
+    seq_len = max(lens)
+    input_ids = torch.zeros((len(batch), seq_len), dtype=torch.long)
+    attention_mask = torch.zeros((len(batch), seq_len), dtype=torch.long)
+    for i, l in enumerate(lens):
+        attention_mask[i, :l] = 1
+    return {'input_ids': input_ids, 'attention_mask': attention_mask}
+
+
+class _FakeEmbedOutput:
+    def __init__(self, attention_mask):
+        import torch
+        b, s = attention_mask.shape
+        # real-token positions are 1.0 in every dim; padding positions are 100.0 -- if mean
+        # pooling failed to exclude padding via the attention mask, the pooled result would be
+        # pulled well above 1.0 whenever a batch mixes short and long texts.
+        real = torch.ones(b, s, text.EMBED_DIM)
+        pad = torch.full((b, s, text.EMBED_DIM), 100.0)
+        self.hidden_states = (torch.where(attention_mask.bool().unsqueeze(-1), real, pad),)
+
+
+def _fake_model_embed(**enc):
+    return _FakeEmbedOutput(enc['attention_mask'])
+
+
+def test_embed_texts_mean_pool_excludes_padding():
+    # batch mixes a 4-token and a 1-token text, so the 1-token row is padded 3 tokens wide
+    out = text.embed_texts(_fake_tok_pad, _fake_model_embed, ['one two three four', 'one'])
+    assert out.shape == (2, text.EMBED_DIM)
+    # both rows must average to exactly 1.0: padding (value 100.0) must be excluded by the
+    # attention mask, not averaged in
+    np.testing.assert_allclose(out, np.ones((2, text.EMBED_DIM), dtype=np.float32))
+
+
+def test_embed_texts_scores_empty_text_as_nan():
+    out = text.embed_texts(_fake_tok_pad, _fake_model_embed, ['one two', '', 'three'])
+    assert out.shape == (3, text.EMBED_DIM)
+    assert np.isnan(out[1]).all()
+    assert not np.isnan(out[0]).any()
+    assert not np.isnan(out[2]).any()
+
+
 # ---------------------------------------------------------------- fixtures for feature building
 
 def _write_filings(path, rows):
@@ -573,6 +621,108 @@ def test_score_finbert_device_max_length_plumbing_cpu(monkeypatch, tmp_path, syn
     )
     assert (out_128['max_length'] == 128).all()
     assert (out_256['max_length'] == 256).all()
+
+
+# ---------------------------------------------------------------- embed_finbert (mocked FinBERT)
+
+def _fake_embed_texts(tok, model, texts, max_length=None, batch_size=None, device='cpu'):
+    # deterministic per-call vector (not per-text) is fine here: these tests only check shape,
+    # dtype, id alignment, and resumability, not embedding content (that's embed_texts's own tests)
+    return np.tile(np.arange(text.EMBED_DIM, dtype=np.float32), (len(texts), 1))
+
+
+def test_embed_finbert_chunks_resume_and_consolidate(monkeypatch, tmp_path, synth_filings_for_score):
+    monkeypatch.setattr(config, 'FILINGS_PATH', synth_filings_for_score)
+    monkeypatch.setattr(config, 'CACHE_DIR', tmp_path / 'cache')
+    (tmp_path / 'cache').mkdir()
+    monkeypatch.setattr(text, 'CHUNK_SIZE', 3)
+
+    calls = {'n': 0}
+
+    def load_calls(*a, **k):
+        calls['n'] += 1
+        return 'TOK', 'MODEL'
+
+    monkeypatch.setattr(text, '_load_finbert', load_calls)
+    monkeypatch.setattr(text, 'embed_texts', _fake_embed_texts)
+
+    text.embed_finbert(max_length=128, device='cpu')
+
+    chunk_dir = tmp_path / 'cache' / 'finbert_emb_chunks_L128'
+    npy_parts = sorted(chunk_dir.glob('part_*.npy'))
+    assert len(npy_parts) == 3  # ceil(7/3)
+    assert len(sorted(chunk_dir.glob('part_*.parquet'))) == 3
+
+    emb_path = tmp_path / 'cache' / 'finbert_emb_L128.npy'
+    ids_path = tmp_path / 'cache' / 'finbert_emb_L128_ids.parquet'
+    assert emb_path.exists() and ids_path.exists()
+
+    emb = np.load(emb_path)
+    ids = pd.read_parquet(ids_path)
+    assert emb.shape == (7, text.EMBED_DIM)
+    assert emb.dtype == np.float16
+    assert len(ids) == 7
+    assert ids['document_id'].is_unique
+    assert set(ids.columns) >= {'document_id', 'permno', 'filing_date'}
+
+    # resumability: delete one chunk, re-run, only that chunk gets rebuilt (model loaded once more)
+    calls['n'] = 0
+    emb_path.unlink()
+    ids_path.unlink()
+    stale = npy_parts[1]
+    stale.unlink()
+    (chunk_dir / f'{stale.stem}.parquet').unlink()
+    text.embed_finbert(max_length=128, device='cpu')
+    assert calls['n'] == 1
+    assert emb_path.exists() and ids_path.exists()
+    emb_after = np.load(emb_path)
+    ids_after = pd.read_parquet(ids_path)
+    assert emb_after.shape == (7, text.EMBED_DIM)
+    assert len(ids_after) == 7
+    assert ids_after['document_id'].is_unique
+
+
+# ---------------------------------------------------------------- load_embeddings
+
+def test_load_embeddings_round_trip(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, 'CACHE_DIR', tmp_path / 'cache')
+    (tmp_path / 'cache').mkdir()
+
+    rng = np.random.RandomState(0)
+    emb = rng.randn(5, text.EMBED_DIM).astype(np.float16)
+    np.save(text.emb_path_for(text.MAX_LENGTH), emb)
+    ids = pd.DataFrame({
+        'document_id': [f'd{i}' for i in range(5)],
+        'permno': [1, 1, 2, 2, 3],
+        'filing_date': pd.to_datetime(
+            ['2020-01-01', '2020-01-02', '2020-02-01', '2020-02-02', '2020-03-01']
+        ),
+    })
+    ids.to_parquet(text.emb_ids_path_for(text.MAX_LENGTH), index=False)
+
+    ids_out, emb_out = text.load_embeddings()
+    assert emb_out.dtype == np.float32
+    assert emb_out.shape == (5, text.EMBED_DIM)
+    np.testing.assert_allclose(emb_out, emb.astype(np.float32))
+    assert ids_out['filing_date'].dtype == np.dtype('datetime64[ns]')
+    assert list(ids_out['document_id']) == list(ids['document_id'])
+    assert list(ids_out['permno']) == list(ids['permno'])
+
+
+def test_load_embeddings_asserts_row_count_match(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, 'CACHE_DIR', tmp_path / 'cache')
+    (tmp_path / 'cache').mkdir()
+
+    np.save(text.emb_path_for(text.MAX_LENGTH), np.zeros((5, text.EMBED_DIM), dtype=np.float16))
+    ids = pd.DataFrame({
+        'document_id': ['d0', 'd1'],  # deliberately fewer rows than the embeddings array
+        'permno': [1, 1],
+        'filing_date': pd.to_datetime(['2020-01-01', '2020-01-02']),
+    })
+    ids.to_parquet(text.emb_ids_path_for(text.MAX_LENGTH), index=False)
+
+    with pytest.raises(AssertionError):
+        text.load_embeddings()
 
 
 # ---------------------------------------------------------------- slow, real-data tests

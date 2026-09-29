@@ -124,3 +124,32 @@ the sum-to-1 check above and from downstream tone aggregates.
 
 Once verified, `src/text.build_text_features()` will pick up `finbert_scores_L512.parquet`
 automatically (it always reads `scores_path_for(MAX_LENGTH)`, and `MAX_LENGTH` defaults to 512).
+
+## 7. Embedding pass (event-type clustering)
+
+Separate chunked/resumable pass over the same cleaned/truncated text and the same pinned model,
+computing one 768-d mean-pooled embedding per filing (used downstream to cluster filings into
+event types -- PCA then k-means, `docs/SPEC.md` section 4 -- not for tone scoring). Run after the
+precision check above (same GPU/fp16 assumptions); it can run before, after, or combined with the
+scoring pass:
+
+```bash
+python -m src.text --embed --device cuda --max-length 512
+# or do both passes in one invocation:
+python -m src.text --score --embed --device cuda --max-length 512
+```
+
+`--batch-size` defaults the same way as `--score` (256 on GPU). Resumable the same way: chunks are
+written under `outputs/cache/finbert_emb_chunks_L512/` (a `.npy` float16 array + a small
+`.parquet` of `document_id`/`permno`/`filing_date` per chunk, same row order), and a re-run skips
+chunks already written.
+
+Output, written once every chunk for this max_length exists:
+- `outputs/cache/finbert_emb_L512.npy` -- float16 ndarray, shape `(373139, 768)`, ~0.57 GB
+  (373,139 x 768 x 2 bytes).
+- `outputs/cache/finbert_emb_L512_ids.parquet` -- `document_id`/`permno`/`filing_date`; row *i*
+  matches row *i* of the `.npy` file.
+
+Copy both files back to the laptop the same way as step 5 (same `scp` pattern, both filenames).
+`src/text.load_embeddings()` reads the consolidated pair (asserting their row counts match) and
+returns `(ids_df, emb)` with `emb` upcast to float32.

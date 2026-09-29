@@ -118,3 +118,40 @@ other amendments are bug fixes or pre-test decisions and remain. The A12/A15 var
 selectable via config.HEADLINE_SIGNAL / config.BETA_MODEL and pred_ew is always reported as an
 ablation. For reference, results already seen before this reversion (DGX runs): pre-registered beta
 run -- pred_ew IR 1.30, beta -0.33; pred_gate ablation IR 0.80. A15 run -- pred_ew IR 1.14, beta -0.27.
+
+## 2026-09-28
+The book is now beta-neutral with a flexible net exposure (net chosen by the optimizer each
+month within +-25%, gross fixed at 200%), replacing strict dollar neutrality; the trailing-beta
+hedge was removed. The headline signal is now chosen per test year on that year's validation
+window among the equal-weight blend, the single all-feature LightGBM and their 50/50 blend
+(walk-forward, no test data). New components: better beta estimates (precision-weighted blend of
+multi-horizon betas with a size/volatility/sector/age prior, and a Kalman filter; parameters
+fitted on 2015-2017 formation months), optional robust beta margin, a short-side tradability
+screen, per-window factor selection, and FinBERT event-geometry features. These changes were made
+after test-period results had been seen; every choice is made on validation or pre-2019 data only.
+
+## 2026-09-28 -- beta target (post-hoc, disclosed): validation-only horse race
+A validation-only horse race (2019-2020 validation + 2016-18 pseudo-history; no test data)
+compared beta models and net-exposure regimes on realized book beta. Grid summary (realized beta
+on 2019-2020 validation): blume/dollar -0.40; fusion/dollar -0.19; fusion/dollar with BETA_TOL
+tightened to 0.005 -0.16; kalman roughly matches fusion; a flexible net exposure (NET_MODE='beta')
+did not improve realized beta and instead drifted the book net long with the signal; kappa>=0.5
+(BETA_UNC_KAPPA) was infeasible in a meaningful share of months. In every case the optimizer pins
+ex-ante beta at the tolerance edge, and realized short-leg beta exceeds realized long-leg beta even
+under the improved 'fusion' betas, leaving realized book beta negative. The fix is a small positive
+ex-ante beta target (config.BETA_TARGET) rather than a further beta-model or net-exposure change.
+Dose-response (ex-ante target -> realized beta, pseudo-history 2016-18 / validation 2019-2020):
+0 -> -0.11 / -0.16; 0.05 -> -0.02 / -0.07; 0.075 -> +0.02 / -0.03; 0.10 -> +0.06 / +0.02. Target
+0.075 (zero crossing on pseudo-history ~0.065) was chosen as the best available candidate: it was
+feasible in all 92 real months (0 relaxations) and lands close to zero realized beta on both
+windows without overshooting positive on validation. Chosen config: BETA_MODEL='fusion',
+NET_MODE='dollar' (flexible net kept selectable but not used), BETA_UNC_KAPPA=0.0 (kept off --
+margin is on the wrong scale given noise in the 12-month realized-beta calibration target),
+BETA_TOL=0.005, BETA_TARGET=0.075, N_CAND=350, SHORT_SCREEN=True, NET_PENALTY=100.0 (only active
+if NET_MODE='beta' is selected). Caveat: the 2016-18 pseudo-history overlaps the window used to
+calibrate the 'fusion'/'a15' beta coefficients (2015-2017) and BETA_MISSING (pre-2019 mean), so the
+2019-2020 validation numbers are the clean evidence; pseudo-history is directionally consistent but
+not independent confirmation. Also in this pass: FEATURE_SELECTION defaults to False and a new
+SELECTION_REPORT=True keeps the per-window factor-selection diagnostic table for reporting only,
+since validation (2019-2020) showed selection lowering IC (lgbm_all 0.022 vs 0.032, ew 0.014 vs
+0.016, selection vs none).

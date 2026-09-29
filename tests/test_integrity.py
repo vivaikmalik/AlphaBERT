@@ -252,6 +252,13 @@ def test_mini_end_to_end_pipeline(mini_panel, monkeypatch, tmp_path):
     panel, state = mini_panel
     _patch_mini_config(monkeypatch)
     monkeypatch.setattr(config, 'N_CAND', 150)
+    # SHORT_SCREEN off: on this 600-permno subset, the me/dolvol tradability screen leaves the
+    # short leg sector-lopsided enough to break sector neutrality (this fixture is a random
+    # 600-name subset, far smaller/sparser than the real universe SHORT_SCREEN was tuned
+    # against). This is a mechanics/interface smoke test (see module docstring), not a
+    # SHORT_SCREEN check -- that's covered on its own synthetic fixture in
+    # tests/test_portfolio.py::test_short_screen_excludes_illiquid_names_from_short_leg_only.
+    monkeypatch.setattr(config, 'SHORT_SCREEN', False)
 
     preds = models.run_all(panel, state, cache_dir=tmp_path / 'cache')
     print(f'[integrity] mini run_all done in {time.time() - t0:.1f}s')
@@ -278,8 +285,12 @@ def test_mini_end_to_end_pipeline(mini_panel, monkeypatch, tmp_path):
         assert 100 <= n_names <= 500, f'{mth}: n_names={n_names}'
         long_w = nz.loc[nz['weight'] > 0, 'weight']
         short_w = nz.loc[nz['weight'] < 0, 'weight']
-        assert long_w.sum() == pytest.approx(1.0, abs=1e-4), f'{mth}: long leg != 1'
-        assert short_w.sum() == pytest.approx(-1.0, abs=1e-4), f'{mth}: short leg != -1'
+        # NET_MODE='beta' (default): legs sum to 1+n/2 / -(1-n/2) for the month's own solved
+        # net exposure n, rather than the fixed +-1 of NET_MODE='dollar'.
+        n_val = float(long_w.sum() + short_w.sum())
+        assert abs(n_val) <= config.NET_CAP + 1e-4, f'{mth}: |net| exceeds NET_CAP'
+        assert long_w.sum() == pytest.approx(1.0 + n_val / 2.0, abs=1e-4), f'{mth}: long leg off target'
+        assert short_w.sum() == pytest.approx(-(1.0 - n_val / 2.0), abs=1e-4), f'{mth}: short leg off target'
         assert nz['weight'].abs().max() <= config.MAX_WEIGHT + 1e-6
 
     # ---- returns mechanics ---------------------------------------------------
@@ -287,14 +298,16 @@ def test_mini_end_to_end_pipeline(mini_panel, monkeypatch, tmp_path):
         'long_ret', 'short_ret', 'ls_ret', 'rf_m', 'total_ret', 'bench_ret', 'active_ret',
         'sp500_ret', 'sp500_exret', 'n_long', 'n_short', 'gross', 'net', 'beta_exante',
         'turnover', 'cost', 'total_ret_net', 'active_ret_net', 'missing_ret_weight',
-        'filer_net', 'first_month', 'relax',
+        'filer_net', 'first_month', 'relax', 'net_target',
     }
     assert expected_cols <= set(returns.columns), f'missing columns: {expected_cols - set(returns.columns)}'
     assert not returns['total_ret'].isna().any()
 
-    # filer-net-neutral (A10): within SECTOR_TOL, widened x2 on rows where relax widened 'sector'
+    # filer-net-neutral (A10): within SECTOR_TOL of n*filer_share (relative constraint under
+    # NET_MODE='beta', see src/portfolio.py optimize_month/_group_shares; conservatively
+    # bounded here by NET_CAP since s_g <= 1), widened x2 on rows where relax widened 'sector'
     allowed = np.where(returns['relax'].str.contains('sector', na=False), 2 * config.SECTOR_TOL,
-                        config.SECTOR_TOL) + 1e-5
+                        config.SECTOR_TOL) + returns['net_target'].abs().to_numpy() + 1e-5
     assert (returns['filer_net'].abs() <= allowed).all()
 
     # ---- write_submission ------------------------------------------------------
@@ -309,8 +322,12 @@ def test_mini_end_to_end_pipeline(mini_panel, monkeypatch, tmp_path):
     h = pd.read_csv(sub_dir / 'holdings.csv')
     assert (pd.to_datetime(h['Date']).dt.day == 1).all()
     for d, g in h.groupby('Date')['WEIGHT']:
-        assert abs(g[g > 0].sum() - 100.0) < 1e-6, f'{d}: long WEIGHT != 100'
-        assert abs(g[g < 0].sum() + 100.0) < 1e-6, f'{d}: short WEIGHT != -100'
+        # NET_MODE='beta' (default): legs sum to 100*(1+n/2) / -100*(1-n/2), n derived from
+        # the month's own weights (see portfolio._round_submission_weights).
+        n = float(g.sum()) / 100.0
+        assert abs(n) <= 0.50 + 1e-6, f'{d}: net exposure exceeds the +-50% mandate'
+        assert abs(g[g > 0].sum() - 100.0 * (1.0 + n / 2.0)) < 1e-6, f'{d}: long WEIGHT off target'
+        assert abs(g[g < 0].sum() + 100.0 * (1.0 - n / 2.0)) < 1e-6, f'{d}: short WEIGHT off target'
     assert h['WEIGHT'].abs().max() <= config.MAX_WEIGHT * 100.0 + 1e-6
 
     # ---- evaluate: proves the interface composes (TEST_END patched to 2021-12-31 so

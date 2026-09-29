@@ -6,7 +6,7 @@ from src import config
 from src import data as data_mod
 from src.data import (
     _rank_within_eom, universe_mask, build_panel, feature_columns, market_state, load_market,
-    load_chars,
+    load_chars, pipeline_rf,
 )
 
 
@@ -101,6 +101,9 @@ def synthetic_env(tmp_path, monkeypatch):
     cache_dir.mkdir()
     monkeypatch.setattr(config, 'CHARS_PATH', chars_path)
     monkeypatch.setattr(config, 'CACHE_DIR', cache_dir)
+    # the synthetic file lacks the extra raw beta columns the 'fusion'/'kalman' models fit on;
+    # these panel tests are not about beta, so pin the simple model
+    monkeypatch.setattr(config, 'BETA_MODEL', 'blume')
     return raw
 
 
@@ -139,6 +142,58 @@ def test_feature_columns_excludes_target_derived(synthetic_env):
     banned = {'stock_exret', 'ret_exc_lead1m', 'target_month', 'eom', 'date', 'permno'}
     assert banned.isdisjoint(feats)
     assert len(feats) == len(set(feats))
+
+
+def test_pipeline_rf_recovers_rf_from_ret_minus_ret_exc(tmp_path, monkeypatch):
+    """pipeline_rf() = median(ret - ret_exc) per eom -- a hand-computed check with a known,
+    per-eom rf plus per-row noise in ret/ret_exc (the rf itself cancels out of that noise since
+    it's added identically to both, so the difference is exact regardless of noise)."""
+    rng = np.random.default_rng(3)
+    rows = []
+    known_rf = {pd.Timestamp('2016-01-31'): 0.0011, pd.Timestamp('2016-02-29'): 0.0034}
+    for eom, rf in known_rf.items():
+        for p in range(5):
+            base_ret = rng.normal(0.01, 0.05)
+            rows.append({'eom': eom, 'ret': base_ret, 'ret_exc': base_ret - rf})
+    raw = pd.DataFrame(rows)
+    chars_path = tmp_path / 'rf_chars.parquet'
+    raw.to_parquet(chars_path)
+    monkeypatch.setattr(config, 'CHARS_PATH', chars_path)
+
+    rf = pipeline_rf()
+    assert rf.index.name == 'eom'
+    for eom, expected in known_rf.items():
+        assert rf.loc[eom] == pytest.approx(expected, abs=1e-12)
+
+
+def test_pipeline_rf_median_robust_to_a_single_outlier_row(tmp_path, monkeypatch):
+    """One row with a corrupted ret_exc (e.g. a stray NaN turned into a bad number) must not
+    move the recovered rf -- median, not mean."""
+    eom = pd.Timestamp('2016-01-31')
+    rf_true = 0.002
+    rets = [0.01, 0.02, -0.01, 0.03, 0.00]
+    rows = [{'eom': eom, 'ret': r, 'ret_exc': r - rf_true} for r in rets]
+    rows.append({'eom': eom, 'ret': 0.01, 'ret_exc': 0.01 - 5.0})  # wild outlier
+    raw = pd.DataFrame(rows)
+    chars_path = tmp_path / 'rf_chars_outlier.parquet'
+    raw.to_parquet(chars_path)
+    monkeypatch.setattr(config, 'CHARS_PATH', chars_path)
+
+    rf = pipeline_rf()
+    assert rf.loc[eom] == pytest.approx(rf_true, abs=1e-12)
+
+
+@pytest.mark.slow
+def test_real_pipeline_rf_coverage():
+    """Real data: pipeline_rf covers the full backtest holding-month window with no NaN, and
+    values sit in a plausible short-rate range (well under 5%/month)."""
+    rf = pipeline_rf()
+    window = rf.loc['2020-12-31':'2026-08-31']
+    expected_months = pd.date_range('2020-12-31', '2026-08-31', freq='ME')
+    missing = expected_months.difference(window.index)
+    assert len(missing) == 0, f'missing months: {missing.tolist()}'
+    assert not window.isna().any()
+    assert window.abs().max() < 0.05
 
 
 def test_market_state_truncation_invariance(tmp_path, monkeypatch):
@@ -216,6 +271,7 @@ def test_miss_flags_use_only_cutoff_rows(tmp_path, monkeypatch):
     cache_dir.mkdir()
     monkeypatch.setattr(config, 'CHARS_PATH', chars_path)
     monkeypatch.setattr(config, 'CACHE_DIR', cache_dir)
+    monkeypatch.setattr(config, 'BETA_MODEL', 'blume')  # synthetic file lacks fusion's raw beta columns
 
     panel = build_panel()
     assert f'miss_{target_char}' not in panel.columns
@@ -444,6 +500,92 @@ def test_ivp_ranks_within_eom_separately(tmp_path, monkeypatch):
     assert len(set(np.round(beta_eom1, 8))) == 4
 
 
+def test_beta_var_zero_under_blume_and_a15(synthetic_env, monkeypatch):
+    """src/beta.py: 'blume' and 'a15' reproduce the pre-existing formulas exactly, with
+    beta_var == 0 (no uncertainty estimate for those models)."""
+    monkeypatch.setattr(config, 'BETA_MODEL', 'blume')
+    panel_blume = build_panel()
+    assert 'beta_var' in panel_blume.columns
+    assert (panel_blume['beta_var'] == 0.0).all()
+
+    monkeypatch.setattr(config, 'BETA_MODEL', 'a15')
+    panel_a15 = build_panel()
+    assert (panel_a15['beta_var'] == 0.0).all()
+
+
+def _synthetic_raw_beta_calib(n_permnos=12, seed=5):
+    """A larger synthetic panel (2015-01..2018-12, all 147 chars + 'ret') sized so
+    beta.fit_beta_params has enough calibration rows (2015-01..2017-12 formation months) to fit
+    -- used to exercise the 'fusion'/'kalman' beta models end to end through build_panel."""
+    rng = np.random.default_rng(seed)
+    chars = config.load_char_list()
+    eoms = pd.date_range('2015-01-31', periods=48, freq='ME')  # 2015-01..2018-12
+    mkt_ret = pd.Series(rng.normal(0.01, 0.04, len(eoms)), index=eoms)
+    permnos = np.arange(2000, 2000 + n_permnos)
+    true_beta = {p: rng.uniform(0.4, 1.6) for p in permnos}
+    rows = []
+    for eom in eoms:
+        for i, p in enumerate(permnos):
+            tb = true_beta[p]
+            row = {c: rng.normal(0, 1) for c in chars}
+            is_young = i < 2  # first two permnos: always missing beta_60m, like real young stocks
+            row.update({
+                'permno': p, 'eom': eom, 'date': eom,
+                # constant 'me' across permnos: universe_mask's ME_CUTOFF_PCTILE=0.20 filter must
+                # not systematically drop the "young" (low-index) permnos this test relies on.
+                'prc': 20.0, 'me': 1_000_000.0,
+                'gics': f'{10 + i % 3}101010',
+                'beta_60m': np.nan if is_young else tb + rng.normal(0, 0.15),
+                'betabab_1260d': tb + rng.normal(0, 0.15),
+                'betadown_252d': tb + rng.normal(0, 0.2),
+                'beta_dimson_21d': tb + rng.normal(0, 0.3),
+                'ivol_capm_252d': abs(rng.normal(0.02, 0.01)),
+                'age': 12 + i * 3, 'at_be': 1.5 + 0.05 * i,
+                'dolvol_126d': 1000.0, 'size_grp': 'mega',
+                'ticker': f'T{p}', 'company_name': f'C{p}',
+                'ret': tb * mkt_ret.loc[eom] + rng.normal(0, 0.04),
+                'ret_exc_lead1m': rng.normal(0, 0.05),
+            })
+            rows.append(row)
+    return pd.DataFrame(rows), mkt_ret
+
+
+@pytest.fixture()
+def fusion_kalman_env(tmp_path, monkeypatch):
+    raw, mkt_ret = _synthetic_raw_beta_calib()
+    chars_path = tmp_path / 'chars.parquet'
+    raw.to_parquet(chars_path)
+    cache_dir = tmp_path / 'cache'
+    cache_dir.mkdir()
+    monkeypatch.setattr(config, 'CHARS_PATH', chars_path)
+    monkeypatch.setattr(config, 'CACHE_DIR', cache_dir)
+    monkeypatch.setattr(data_mod, 'market_state', lambda: pd.DataFrame({'mkt_ret': mkt_ret}))
+    # pre-fit and cache beta_params.json (needs 'ret', which build_panel's own raw load doesn't
+    # fetch) so build_panel -> _build -> compute_betas('fusion'/'kalman') hits the cache instead
+    # of trying its own (network-free but real-file) load.
+    from src import beta as beta_module
+    beta_module.fit_beta_params(raw)
+    return raw
+
+
+@pytest.mark.parametrize('model', ['fusion', 'kalman'])
+def test_build_panel_fusion_kalman_end_to_end(fusion_kalman_env, monkeypatch, model):
+    monkeypatch.setattr(config, 'BETA_MODEL', model)
+    panel = build_panel()
+    # A16 audit fix #4: fusion/kalman cache filenames carry a hash of beta_params.json's content
+    # (panel_<model>_<8hex>.parquet), not the bare panel_<model>.parquet blume/a15 use.
+    matches = list(config.CACHE_DIR.glob(f'panel_{model}_*.parquet'))
+    assert len(matches) == 1
+    assert not (config.CACHE_DIR / f'panel_{model}.parquet').exists()
+    assert 'beta_var' in panel.columns
+    assert (panel['beta_var'] > 0).all()  # fusion/kalman always carry positive uncertainty
+    assert panel['beta'].notna().all()
+    # the young permnos (2000, 2001; always missing beta_60m) must not be flatly imputed to 1.0
+    # the way 'blume' would -- that's the bug src/beta.py exists to fix.
+    young = panel.loc[panel['permno'].isin([2000, 2001])]
+    assert not np.allclose(young['beta'], 1.0, atol=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # slow tests on real data
 # ---------------------------------------------------------------------------
@@ -490,7 +632,7 @@ def test_real_load_market_coverage():
     expected_months = pd.date_range('2020-12-31', '2026-08-31', freq='ME')
     missing = expected_months.difference(window.index)
     assert len(missing) == 0, f'missing months: {missing.tolist()}'
-    assert not window[['tb3ms', 'rf_m', 'sp500_ret', 'sp500_exret']].isna().any().any()
+    assert not window[['tb3ms', 'rf_m', 'sp500_ret', 'sp500_exret', 'rf_pipe']].isna().any().any()
 
 
 @pytest.mark.slow

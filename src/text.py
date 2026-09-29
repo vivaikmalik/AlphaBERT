@@ -27,6 +27,15 @@ masked case-sensitively and only if it's long/distinctive enough). A filing that
 scored NaN (score_texts), not as an empty string. Consolidated score output is per-setting
 (scores_path_for(max_length) -> CACHE_DIR/'finbert_scores_L{max_length}.parquet') so different
 max_length/cleaning runs never silently mix.
+
+Embedding pass (`--embed`, embed_texts/embed_finbert/load_embeddings): a second, separate chunked
+pass over the same cleaned/truncated text and the same pinned model, used downstream to cluster
+filings into event types (PCA -> k-means, docs/SPEC.md section 4) rather than to score tone. Each
+filing gets one EMBED_DIM=768 vector: the last hidden state (hidden_states[-1] from the same
+classification model, output_hidden_states=True) mean-pooled over the attention mask (padding
+excluded), accumulated in fp32. Consolidated output is emb_path_for(max_length) (float16 ndarray)
++ emb_ids_path_for(max_length) (its row-order key), independent of the scores file/cache so a
+scoring-only run never needs the embedding pass or vice versa.
 """
 import argparse
 import re
@@ -41,6 +50,7 @@ from src import config
 FINBERT_MODEL = 'ProsusAI/finbert'
 FINBERT_REVISION = '4556d13015211d73dccd3fdd39d39232506f3e43'  # pinned commit (HF hub main @ 2026-09-27)
 NUM_THREADS = 10
+EMBED_DIM = 768  # FinBERT (BERT-base) hidden size
 # Decision (2026-09-27, before any GPU result was seen): on the DGX Spark GPU, compute is not
 # binding, so MAX_LENGTH is 512 (full event body, BERT's own positional-embedding limit) and
 # precision is fp16 -- run `--check` on the target device first to confirm fp16 vs fp32 agreement.
@@ -290,6 +300,43 @@ def score_texts(tok, model, texts, max_length=MAX_LENGTH, batch_size=BATCH_SIZE,
     return out
 
 
+def embed_texts(tok, model, texts, max_length=MAX_LENGTH, batch_size=BATCH_SIZE, device='cpu'):
+    """Return array (n, EMBED_DIM) float32: mean-pooled last hidden state over the attention mask
+    (padding tokens excluded), for downstream clustering into event types (docs/SPEC.md section 4).
+
+    Uses the same pinned classification model as score_texts, called with output_hidden_states=True
+    so hidden_states[-1] (the final encoder layer, per-token, before the classification head) comes
+    from the identical model/revision as the scores -- not a separate load. Pooling is accumulated
+    in fp32 even when the model runs in fp16 (hidden states are upcast before the masked sum), for
+    the same numerical-stability reason softmax in score_texts is always fp32.
+
+    A text that clean_text() fully stripped to '' scores as NaN (same convention as score_texts),
+    not as an embedding of an empty string. Batches are length-sorted then unsorted back, matching
+    score_texts."""
+    import torch
+
+    out = np.full((len(texts), EMBED_DIM), np.nan, dtype=np.float32)
+    idx_nonempty = [i for i, t in enumerate(texts) if t]
+    if not idx_nonempty:
+        return out
+
+    sub_texts = [texts[i] for i in idx_nonempty]
+    order = sorted(range(len(sub_texts)), key=lambda i: len(sub_texts[i]))
+    with torch.inference_mode():
+        for i in range(0, len(sub_texts), batch_size):
+            idxs = order[i:i + batch_size]
+            batch = [sub_texts[j] for j in idxs]
+            enc = tok(batch, padding=True, truncation=True, max_length=max_length, return_tensors='pt')
+            enc = {k: v.to(device) for k, v in enc.items()}
+            hidden = model(**enc, output_hidden_states=True).hidden_states[-1].float()  # fp32 accumulate
+            mask = enc['attention_mask'].unsqueeze(-1).float()
+            pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+            pooled = pooled.cpu().numpy()
+            for k, j in enumerate(idxs):
+                out[idx_nonempty[j]] = pooled[k]
+    return out
+
+
 def _read_meta(columns):
     meta = pq.read_table(config.FILINGS_PATH, columns=columns).to_pandas()
     return meta.sort_values('filing_date', kind='mergesort').reset_index(drop=True)
@@ -393,6 +440,127 @@ def score_finbert(max_length=None, device='cpu', batch_size=None):
         print(f'score_finbert: consolidated {len(all_df)} rows -> {out_scores_path}')
     else:
         print(f'score_finbert: {len(parts)}/{n_chunks} chunks done, not consolidating yet')
+
+
+def emb_chunk_dir_for(max_length: int):
+    """Cache dir for embedding chunks at a given max_length; mirrors chunk_dir_for (scores) but
+    kept separate so a scoring-only cache never gets mistaken for an embedding cache."""
+    return config.CACHE_DIR / f'finbert_emb_chunks_L{max_length}'
+
+
+def emb_path_for(max_length: int):
+    """Consolidated embeddings path (float16 ndarray, shape (N, EMBED_DIM)); settings-specific
+    like scores_path_for."""
+    return config.CACHE_DIR / f'finbert_emb_L{max_length}.npy'
+
+
+def emb_ids_path_for(max_length: int):
+    """Row-order key (document_id/permno/filing_date) for emb_path_for's ndarray -- row i of one
+    file matches row i of the other."""
+    return config.CACHE_DIR / f'finbert_emb_L{max_length}_ids.parquet'
+
+
+def embed_finbert(max_length=None, device='cpu', batch_size=None):
+    """Chunked, resumable FinBERT embedding pass -> emb_path_for(max_length) + emb_ids_path_for.
+
+    Mirrors score_finbert's chunked/resumable pattern (same meta ordering, same chunk_dir-exists
+    resume check, same NUM_THREADS/device/dtype setup via _setup), but each chunk writes a .npy
+    (float16, mean-pooled embeddings, embed_texts) alongside a small .parquet of
+    document_id/permno/filing_date in the same row order, since a single ndarray can't carry ids.
+    Consolidation concatenates all chunks, drops any duplicate document_id (defensive, matching
+    score_finbert) and sorts by filing_date -- applying the identical row selection to the ndarray
+    and the ids frame so they stay row-aligned."""
+    max_length = MAX_LENGTH if max_length is None else max_length
+    device, batch_size, dtype = _setup(device, batch_size)
+    chunk_dir = emb_chunk_dir_for(max_length)
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    out_emb_path = emb_path_for(max_length)
+    out_ids_path = emb_ids_path_for(max_length)
+
+    meta = _read_meta(['document_id', 'permno', 'filing_date', 'company_name', 'content_company_name', 'ticker'])
+    n = len(meta)
+    n_chunks = (n + CHUNK_SIZE - 1) // CHUNK_SIZE
+    print(f'embed_finbert: {n} filings, {n_chunks} chunks of {CHUNK_SIZE}, '
+          f'max_length={max_length}, device={device}, dtype={dtype}, batch_size={batch_size}, '
+          f'chunk_dir={chunk_dir}', flush=True)
+
+    def _chunk_paths(c):
+        return chunk_dir / f'part_{c:05d}.npy', chunk_dir / f'part_{c:05d}.parquet'
+
+    def _chunk_done(c):
+        emb_p, ids_p = _chunk_paths(c)
+        return emb_p.exists() and ids_p.exists()
+
+    remaining_chunks = [c for c in range(n_chunks) if not _chunk_done(c)]
+    done = n - sum(min((c + 1) * CHUNK_SIZE, n) - c * CHUNK_SIZE for c in remaining_chunks)
+    if not remaining_chunks:
+        print('embed_finbert: all chunks already done')
+    else:
+        wanted_ids = set(meta['document_id'].iloc[
+            [i for c in remaining_chunks for i in range(c * CHUNK_SIZE, min((c + 1) * CHUNK_SIZE, n))]
+        ])
+        texts_by_id = _texts_for_ids(wanted_ids)
+
+    tok = model = None
+    t0 = time.time()
+    for c in remaining_chunks:
+        emb_out_path, ids_out_path = _chunk_paths(c)
+        lo, hi = c * CHUNK_SIZE, min((c + 1) * CHUNK_SIZE, n)
+        if tok is None:
+            tok, model = _load_finbert(device=device, dtype=dtype)
+
+        sub = meta.iloc[lo:hi]
+        cleaned = _clean_rows(sub, texts_by_id)
+
+        emb = embed_texts(tok, model, cleaned, max_length=max_length, batch_size=batch_size, device=device)
+        np.save(emb_out_path, emb.astype(np.float16))
+        ids_df = pd.DataFrame({
+            'document_id': sub['document_id'].values,
+            'permno': sub['permno'].values,
+            'filing_date': sub['filing_date'].values,
+        })
+        ids_df.to_parquet(ids_out_path, index=False)
+        done += (hi - lo)
+        elapsed = time.time() - t0
+        rate = done / elapsed if elapsed > 0 else 0
+        eta_min = (n - done) / rate / 60 if rate > 0 else float('nan')
+        n_empty = int(np.isnan(emb[:, 0]).sum())
+        print(f'  chunk {c + 1}/{n_chunks} done ({done}/{n}, {done / n:.1%}), '
+              f'{rate:.1f} docs/s, ETA {eta_min:.0f} min, {n_empty} empty-text (NaN) this chunk', flush=True)
+
+    npy_parts = sorted(chunk_dir.glob('part_*.npy'))
+    if len(npy_parts) == n_chunks:
+        all_emb = np.concatenate([np.load(p) for p in npy_parts], axis=0)
+        all_ids = pd.concat(
+            [pd.read_parquet(chunk_dir / f'{p.stem}.parquet') for p in npy_parts], ignore_index=True
+        )
+        all_ids['_row'] = np.arange(len(all_ids))
+        all_ids = all_ids.drop_duplicates('document_id').sort_values('filing_date').reset_index(drop=True)
+        all_emb = all_emb[all_ids['_row'].to_numpy()]
+        all_ids = all_ids.drop(columns='_row')
+        np.save(out_emb_path, all_emb)
+        all_ids.to_parquet(out_ids_path, index=False)
+        print(f'embed_finbert: consolidated {len(all_ids)} rows -> {out_emb_path}, {out_ids_path}')
+    else:
+        print(f'embed_finbert: {len(npy_parts)}/{n_chunks} chunks done, not consolidating yet')
+
+
+def load_embeddings(max_length=None):
+    """Load the consolidated FinBERT embeddings (embed_finbert's output) -> (ids_df, emb).
+
+    ids_df: document_id/permno/filing_date, filing_date normalized to datetime64[ns]. emb: float32
+    ndarray (N, EMBED_DIM) (upcast from the on-disk float16); row i of emb matches row i of
+    ids_df. Asserts the two files' row counts match -- a mismatch would silently misassign
+    filings to the wrong embedding row."""
+    max_length = MAX_LENGTH if max_length is None else max_length
+    ids_path, emb_path = emb_ids_path_for(max_length), emb_path_for(max_length)
+    ids_df = pd.read_parquet(ids_path).reset_index(drop=True)
+    emb = np.load(emb_path).astype(np.float32)
+    assert len(ids_df) == emb.shape[0], (
+        f'{ids_path.name} has {len(ids_df)} rows but {emb_path.name} has {emb.shape[0]} rows'
+    )
+    ids_df['filing_date'] = pd.to_datetime(ids_df['filing_date']).astype('datetime64[ns]')
+    return ids_df, emb
 
 
 def check_precision(n: int = 500, device: str = 'cpu', max_length=None, batch_size=None):
@@ -599,6 +767,8 @@ def filing_coverage_by_exit() -> pd.DataFrame:
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--score', action='store_true', help='run the full chunked FinBERT scoring pass')
+    parser.add_argument('--embed', action='store_true',
+                         help='run the full chunked FinBERT embedding pass (mean-pooled 768-d vectors)')
     parser.add_argument('--check', type=int, nargs='?', const=500, default=None, metavar='N',
                          help='precision check: score N docs (default 500) in fp32 vs the fast dtype, then exit')
     parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='cpu')
@@ -611,8 +781,15 @@ if __name__ == '__main__':
     args = _parse_args()
     if args.check is not None:
         check_precision(n=args.check, device=args.device, max_length=args.max_length, batch_size=args.batch_size)
-    elif args.score:
-        score_finbert(max_length=args.max_length, device=args.device, batch_size=args.batch_size)
+    elif args.score or args.embed:
+        # Separate passes (each its own chunked/resumable model pass) rather than one combined
+        # forward pass -- keeps score_finbert/embed_finbert independently resumable and simple;
+        # --score --embed in one invocation just runs both in turn.
+        if args.score:
+            score_finbert(max_length=args.max_length, device=args.device, batch_size=args.batch_size)
+        if args.embed:
+            embed_finbert(max_length=args.max_length, device=args.device, batch_size=args.batch_size)
     else:
-        print('usage: python -m src.text --score [--device {auto,cpu,cuda}] [--max-length N] [--batch-size N]')
+        print('usage: python -m src.text --score [--embed] [--device {auto,cpu,cuda}] [--max-length N] [--batch-size N]')
+        print('       python -m src.text --embed [--device {auto,cpu,cuda}] [--max-length N] [--batch-size N]')
         print('       python -m src.text --check [N] [--device {auto,cpu,cuda}]')

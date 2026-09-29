@@ -1,4 +1,5 @@
 """Panel construction, universe, ranks, market state, external market data. See docs/SPEC.md section 3."""
+import hashlib
 import io
 import urllib.request
 
@@ -6,6 +7,8 @@ import numpy as np
 import pandas as pd
 
 from src import config
+from src import beta as beta_mod
+from src.beta import compute_betas
 
 FRED_TB3MS_URL = 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=TB3MS'
 FRED_SP500_URL = 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500'
@@ -17,6 +20,23 @@ def load_chars(columns=None) -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c]).astype('datetime64[ns]')
     return df
+
+
+def pipeline_rf() -> pd.Series:
+    """The risk-free rate baked into the data provider's excess-return columns, recovered
+    directly from the raw chars file rather than assumed to equal/cancel with rf_m (the T-bill
+    rate loaded in load_market()). For any stock-month, ret_exc = ret - rf_pipe, so rf_pipe is
+    observable as (ret - ret_exc) -- constant within an eom to ~3e-17; median taken per eom for
+    robustness. Indexed by eom (month-end), the same convention ret/ret_exc themselves use --
+    NOT lagged like ret_exc_lead1m, so this is the rf baked into the return realized DURING that
+    calendar month, i.e. pipeline_rf.loc[h] is the rf baked into holding month h's realized
+    ret_exc_lead1m (which was recorded one eom earlier, at h - 1 month-end, as the forward
+    return into h)."""
+    raw = load_chars(columns=['eom', 'ret', 'ret_exc'])
+    rf = (raw['ret'] - raw['ret_exc']).groupby(raw['eom']).median()
+    rf.index.name = 'eom'
+    rf.name = 'rf_pipe'
+    return rf
 
 
 def universe_mask(raw: pd.DataFrame) -> pd.Series:
@@ -51,9 +71,6 @@ def _build(raw: pd.DataFrame) -> pd.DataFrame:
     # raw copies needed for aux columns before the same-named 147-char columns get rank-transformed
     prc_raw = df['prc'].copy()
     dolvol_raw = df['dolvol_126d'].copy()
-    beta_raw = df['beta_60m'].copy()
-    betabab_raw = df['betabab_1260d'].copy()
-    ivol252_raw = df['ivol_capm_252d'].copy()
 
     # miss_ flags: selected on universe rows with eom <= cutoff, applied to all universe rows
     cutoff_rows = df.loc[df['eom'] <= config.MISS_FLAG_CUTOFF, chars]
@@ -68,20 +85,12 @@ def _build(raw: pd.DataFrame) -> pd.DataFrame:
     gics2 = pd.Series(np.where(df['gics'].isna(), 'NA', df['gics'].astype(str).str.slice(0, 2)), index=df.index)
     # A16 (2026-09-28, docs/SPEC.md section 10): the beta model (A15) was decided after
     # test-period numbers had been seen, so config.BETA_MODEL selects between the pre-registered
-    # design (default) and the A15 fix (kept selectable, ablation-only, for reproducibility).
-    if config.BETA_MODEL == 'blume':
-        # pre-registered: Blume-shrunk beta_60m, missing beta_60m -> 1.0.
-        beta = ((1 - config.BETA_SHRINK) * beta_raw + config.BETA_SHRINK).fillna(1.0)
-    else:
-        # A15 (beta model fix, docs/SPEC.md section 10): fractional-parity Frazzini-Pedersen (2014)
-        # "betting against beta" beta (betabab_1260d; correlation from ~5y returns, vol from ~1y),
-        # falling back to a Blume-adjusted beta_60m, then to BETA_MISSING when both are missing;
-        # blended with the within-eom percentile of 252-day CAPM idio vol.
-        b1 = ((config.BETA_FP_W * betabab_raw.clip(-1, 4) + config.BETA_FP_C)
-              .fillna(0.67 * beta_raw + 0.33)
-              .fillna(config.BETA_MISSING))
-        ivp = ivol252_raw.groupby(df['eom']).rank(pct=True).fillna(0.5)
-        beta = config.BETA_INTERCEPT + config.BETA_SLOPE * b1 + config.BETA_IVOL * ivp
+    # design (default), the A15 fix, and the point-in-time-calibrated 'fusion'/'kalman' models
+    # (src/beta.py) built to fix the beta_60m-missing -> beta-1.0 imputation bug (docs/research_log.md,
+    # A15 entry). `df` still has raw (unranked) chars at this point, which is what compute_betas needs.
+    beta_df = compute_betas(df, config.BETA_MODEL)
+    beta = beta_df['beta']
+    beta_var = beta_df['beta_var']
     log_me = np.log(df['me'])
     size_z = log_me.groupby(df['eom']).transform(lambda s: (s - s.mean()) / s.std())
     # NOTE deviation from literal SPEC wording: 'prc' and 'dolvol_126d' are both feature-char names
@@ -90,7 +99,7 @@ def _build(raw: pd.DataFrame) -> pd.DataFrame:
     # under '<name>_raw' instead. 'me' has no such collision and stays raw.
     aux = pd.DataFrame({
         **miss_flags,
-        'gics2': gics2, 'beta': beta, 'size_z': size_z,
+        'gics2': gics2, 'beta': beta, 'beta_var': beta_var, 'size_z': size_z,
         'prc_raw': prc_raw, 'dolvol_126d_raw': dolvol_raw,
     }, index=df.index)
     lead = pd.DataFrame({'target_month': target_month, 'stock_exret': stock_exret}, index=df.index)
@@ -103,8 +112,16 @@ def _build(raw: pd.DataFrame) -> pd.DataFrame:
 def build_panel() -> pd.DataFrame:
     # A16: the beta model name is baked into the cache filename (panel_blume.parquet /
     # panel_a15.parquet) so a cache built under one config.BETA_MODEL is never silently reused
-    # after switching to the other.
-    cache_path = config.CACHE_DIR / f'panel_{config.BETA_MODEL}.parquet'
+    # after switching to the other. For 'fusion'/'kalman' (audit fix #4), the filename also carries
+    # a short hash of beta_params.json's content, so a refit of those calibration numbers (e.g. the
+    # version bump in src/beta.py) can never silently reuse a panel built under the old params --
+    # it gets a new cache path instead. Ensure params are current (fit/refit as needed) first.
+    if config.BETA_MODEL in ('fusion', 'kalman'):
+        beta_mod._load_or_fit_params()
+        params_hash = hashlib.md5((config.CACHE_DIR / 'beta_params.json').read_bytes()).hexdigest()[:8]
+        cache_path = config.CACHE_DIR / f'panel_{config.BETA_MODEL}_{params_hash}.parquet'
+    else:
+        cache_path = config.CACHE_DIR / f'panel_{config.BETA_MODEL}.parquet'
     if cache_path.exists():
         cached = pd.read_parquet(cache_path)
         for c in ('eom', 'target_month', 'date'):
@@ -235,6 +252,9 @@ def load_market() -> pd.DataFrame:
     df['rf_m'] = df['tb3ms'] / 1200
     df['sp500_exret'] = df['sp500_ret'] - df['rf_m']
     df.index.name = 'eom'
+    # the data provider's own risk-free rate (distinct from rf_m above), needed by
+    # portfolio.compute_month_return's net-exposure accounting term -- see pipeline_rf().
+    df['rf_pipe'] = pipeline_rf().reindex(df.index)
 
     aug2026 = pd.Timestamp('2026-08-31')
     if aug2026 not in df.index:

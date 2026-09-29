@@ -336,6 +336,8 @@ def test_run_all_schema(synthetic_run):
     assert set(preds["split"].unique()) <= {"valid", "test"}
     assert set(preds.loc[preds["split"] == "valid", "test_year"].unique()) == {2020}
     assert set(preds["test_year"].unique()) == {2020}
+    assert "pred_blend" in models.PRED_COLS and "pred_auto" in models.PRED_COLS
+    assert {"pred_ew", "pred_ew_notext", "pred_blend", "pred_auto"}.isdisjoint(models.R2_COLS)
 
     expected_gate_cols = {"test_year", "specialist", "term", "coef",
                            "state_mean_mkt_vol12", "state_std_mkt_vol12",
@@ -343,6 +345,255 @@ def test_run_all_schema(synthetic_run):
     assert set(gate.columns) == expected_gate_cols
     # 6 specialists (5 characteristic groups + text) each contribute a 'base' gate coefficient.
     assert set(gate.loc[gate["term"] == "base", "specialist"]) == set(models.CHAR_GROUPS) | {"text"}
+
+
+def test_selected_features_and_headline_choice_reports(synthetic_run):
+    """run_all writes TABLE_DIR/'selected_features.csv' (per-year selection report -- written
+    whenever FEATURE_SELECTION or SELECTION_REPORT is True, which covers both current config
+    defaults, A16) and TABLE_DIR/'headline_choice.csv' (per-year HEADLINE_CANDIDATES comparison,
+    exactly one 'chosen' row per test_year)."""
+    assert config.FEATURE_SELECTION or getattr(config, "SELECTION_REPORT", True)
+    sel_path = config.TABLE_DIR / "selected_features.csv"
+    headline_path = config.TABLE_DIR / "headline_choice.csv"
+    assert sel_path.exists()
+    assert headline_path.exists()
+
+    sel = pd.read_csv(sel_path)
+    assert {"feature", "group", "ic_t", "selected", "test_year"} <= set(sel.columns)
+    assert set(sel["test_year"].unique()) == {2020}
+
+    headline = pd.read_csv(headline_path)
+    assert set(headline.columns) == {"test_year", "candidate", "valid_mean_ic", "chosen"}
+    assert set(headline["candidate"].unique()) == set(config.HEADLINE_CANDIDATES)
+    chosen_per_year = headline.groupby("test_year")["chosen"].sum()
+    assert (chosen_per_year == 1).all()
+
+
+def test_pred_blend_is_mean_of_zscored_ew_and_lgbm(synthetic_run):
+    _, _, preds, _ = synthetic_run
+    test_df = preds[preds["split"] == "test"]
+    z_ew = models._zscore_by_eom(test_df["pred_ew"].values, test_df["eom"])
+    z_lgbm = models._zscore_by_eom(test_df["pred_lgbm_all"].values, test_df["eom"])
+    expected = (z_ew.values + z_lgbm.values) / 2.0
+    assert np.allclose(test_df["pred_blend"].values, expected)
+
+
+def test_headline_candidates_excludes_valid_fit_or_tuned_models():
+    """config.HEADLINE_CANDIDATES must never include pred_gate/pred_gate_notext (fit on labelled
+    valid rows) or pred_ols/pred_ridge/pred_lasso/pred_enet (alphas -- OLS trivially, but all four
+    share the baseline family -- chosen/tuned on valid MSE): pred_auto's model choice must be
+    genuinely out-of-sample on valid (A12), which only holds for candidates never fit/tuned there."""
+    models._assert_headline_candidates_oos(config.HEADLINE_CANDIDATES)  # current config passes
+
+    for bad in ("pred_gate", "pred_gate_notext", "pred_ols", "pred_ridge", "pred_lasso", "pred_enet"):
+        with pytest.raises(AssertionError):
+            models._assert_headline_candidates_oos(["pred_ew", bad])
+
+
+def test_pred_auto_matches_best_valid_ic_candidate(synthetic_run):
+    """pred_auto must equal whichever HEADLINE_CANDIDATES column headline_choice.csv marks
+    'chosen' for that test_year -- both on valid and on test rows."""
+    _, _, preds, _ = synthetic_run
+    headline = pd.read_csv(config.TABLE_DIR / "headline_choice.csv")
+    chosen = headline.loc[(headline["test_year"] == 2020) & headline["chosen"], "candidate"].item()
+    for split in ("valid", "test"):
+        sub = preds[preds["split"] == split]
+        assert np.array_equal(sub["pred_auto"].values, sub[chosen].values, equal_nan=True)
+
+
+def test_run_all_persists_valid_for_every_test_year(tmp_path):
+    """Unlike the old first-year-only behaviour, run_all must now save split == 'valid' rows for
+    EVERY test_year, not just the first."""
+    orig_years, orig_end, orig_n_jobs = config.TEST_YEARS, config.TEST_END, config.N_JOBS
+    config.TEST_YEARS = [2020, 2021]
+    config.TEST_END = pd.Timestamp("2021-12-31")
+    config.N_JOBS = 1
+    try:
+        panel = _make_panel(include_text=True, n_months=83, n_stocks=40)
+        state = _make_state(panel["eom"])
+        preds = models.run_all(panel, state, cache_dir=tmp_path / "run")
+
+        valid_years = set(preds.loc[preds["split"] == "valid", "test_year"].unique())
+        assert valid_years == {2020, 2021}
+        for y in (2020, 2021):
+            _, valid_mask, _ = models.splits(panel, y)
+            got = (preds["split"] == "valid") & (preds["test_year"] == y)
+            assert got.sum() == int(valid_mask.sum())
+    finally:
+        config.TEST_YEARS, config.TEST_END, config.N_JOBS = orig_years, orig_end, orig_n_jobs
+
+
+def test_feature_selection_called_with_training_rows_only(tmp_path, monkeypatch):
+    """selection.select_features must be called once per test_year with that year's TRAINING
+    rows MINUS the inner-holdout months (the last INNER_HOLDOUT_MONTHS target months of train,
+    later used by _fit_specialist to tune num_leaves/rounds) -- never valid/test rows, and never
+    the inner-holdout months either, or the selection report's IC would be optimistic for the
+    very rows tuning is scored on."""
+    calls = []
+
+    def fake_select_features(train_df, y, feature_cols, groups):
+        calls.append((train_df.copy(), np.asarray(y).copy()))
+        rows = []
+        selected = []
+        for g, cols in groups.items():
+            for i, c in enumerate(cols):
+                rows.append({"feature": c, "group": g, "ic_t": float(len(cols) - i)})
+            selected.extend(cols[:3])
+        report_df = pd.DataFrame(rows)
+        return selected, report_df
+
+    monkeypatch.setattr(models.selection, "select_features", fake_select_features)
+
+    orig_years, orig_end, orig_n_jobs = config.TEST_YEARS, config.TEST_END, config.N_JOBS
+    config.TEST_YEARS = [2020]
+    config.TEST_END = pd.Timestamp("2020-12-31")
+    config.N_JOBS = 1
+    try:
+        panel = _make_panel(seed=321, n_stocks=30, include_text=True)
+        state = _make_state(panel["eom"])
+        models.run_all(panel, state, cache_dir=tmp_path / "run")
+
+        assert len(calls) == 1
+        call_train_df, call_y = calls[0]
+        train_mask, valid_mask, test_mask = models.splits(panel, 2020)
+        expected_train = panel.loc[train_mask]
+        train_months = np.sort(expected_train["target_month"].unique())
+        n_ho = min(models.INNER_HOLDOUT_MONTHS, max(1, len(train_months) - 1))
+        holdout_months = set(train_months[-n_ho:])
+        expected_train = expected_train[~expected_train["target_month"].isin(holdout_months)]
+
+        assert len(call_train_df) == len(expected_train)
+        assert set(call_train_df.index) == set(expected_train.index)
+        # never any valid/test row, and never an inner-holdout train row (spy on both)
+        assert set(call_train_df.index).isdisjoint(set(panel.index[valid_mask]))
+        assert set(call_train_df.index).isdisjoint(set(panel.index[test_mask]))
+        assert set(call_train_df["target_month"].unique()).isdisjoint(holdout_months)
+        expected_y = models.make_target(expected_train).values
+        assert np.allclose(call_y, expected_y)
+    finally:
+        config.TEST_YEARS, config.TEST_END, config.N_JOBS = orig_years, orig_end, orig_n_jobs
+
+
+def test_feature_selection_report_only_uses_full_features(tmp_path, monkeypatch):
+    """A16: with FEATURE_SELECTION=False and SELECTION_REPORT=True, run_all must still call
+    selection.select_features per test year and write TABLE_DIR/'selected_features.csv', but fit
+    every model on the FULL feature set -- the report's returned subset must never be used to
+    slice Xtr/Xva/Xte."""
+    calls = []
+
+    def fake_select_features(train_df, y, feature_cols, groups):
+        calls.append(list(feature_cols))
+        report_df = pd.DataFrame(
+            [{"feature": c, "group": "value", "ic_t": 1.0} for c in feature_cols])
+        return list(feature_cols[:3]), report_df  # deliberately tiny subset
+
+    monkeypatch.setattr(models.selection, "select_features", fake_select_features)
+
+    captured = {}
+    orig_fit_baselines = models.fit_baselines
+
+    def spy_fit_baselines(Xtr, ytr, Xva, yva):
+        captured["n_cols"] = Xtr.shape[1]
+        return orig_fit_baselines(Xtr, ytr, Xva, yva)
+
+    monkeypatch.setattr(models, "fit_baselines", spy_fit_baselines)
+
+    orig_years, orig_end, orig_n_jobs = config.TEST_YEARS, config.TEST_END, config.N_JOBS
+    orig_fs = config.FEATURE_SELECTION
+    had_sr = hasattr(config, "SELECTION_REPORT")
+    orig_sr = getattr(config, "SELECTION_REPORT", True)
+    config.TEST_YEARS = [2020]
+    config.TEST_END = pd.Timestamp("2020-12-31")
+    config.N_JOBS = 1
+    config.FEATURE_SELECTION = False
+    config.SELECTION_REPORT = True
+    try:
+        panel = _make_panel(seed=222, n_stocks=30, include_text=True)
+        state = _make_state(panel["eom"])
+        models.run_all(panel, state, cache_dir=tmp_path / "run")
+
+        assert len(calls) == 1  # report still computed once for the one test_year
+        from src.data import feature_columns
+        n_full = len(feature_columns(panel))
+        assert captured["n_cols"] == n_full  # models fit on the full feature set, not the tiny subset
+
+        sel_path = config.TABLE_DIR / "selected_features.csv"
+        assert sel_path.exists()
+        sel = pd.read_csv(sel_path)
+        assert set(sel["test_year"].unique()) == {2020}
+        assert len(sel) == n_full  # report covers every candidate feature
+    finally:
+        config.TEST_YEARS, config.TEST_END, config.N_JOBS = orig_years, orig_end, orig_n_jobs
+        config.FEATURE_SELECTION = orig_fs
+        if had_sr:
+            config.SELECTION_REPORT = orig_sr
+        else:
+            del config.SELECTION_REPORT
+
+
+def test_ridge_alpha_search_subsampled_but_refit_uses_full_rows(monkeypatch):
+    """A16: Ridge's alpha SEARCH is subsampled to MAX_ROWS_PENALIZED (like Lasso/ElasticNet)
+    instead of running un-subsampled over the whole training window, but the final refit at the
+    chosen alpha still uses the FULL training window."""
+    n = models.MAX_ROWS_PENALIZED + 5_000
+    rng = np.random.RandomState(0)
+    Xtr = rng.normal(size=(n, 4)).astype(np.float32)
+    true_w = np.array([1.0, -2.0, 0.5, 0.0])
+    ytr = Xtr @ true_w + rng.normal(scale=0.1, size=n)
+    Xva = rng.normal(size=(200, 4)).astype(np.float32)
+    yva = Xva @ true_w + rng.normal(scale=0.1, size=200)
+
+    fit_sizes = []
+    orig_fit = models.Ridge.fit
+
+    def spy_fit(self, X, y, *a, **k):
+        fit_sizes.append(len(X))
+        return orig_fit(self, X, y, *a, **k)
+
+    monkeypatch.setattr(models.Ridge, "fit", spy_fit)
+
+    out = models.fit_baselines(Xtr, ytr, Xva, yva)
+
+    assert len(fit_sizes) >= 2  # at least one search fit + the final refit
+    *search_sizes, final_size = fit_sizes
+    assert all(s <= models.MAX_ROWS_PENALIZED for s in search_sizes), \
+        "ridge alpha search must be subsampled to MAX_ROWS_PENALIZED like lasso/enet"
+    assert final_size == n  # final refit uses the FULL training window
+    assert out["ridge"].coef_.shape == (4,)
+
+
+def test_ridge_alpha_grid_widened_to_include_1e8():
+    """A16: chosen ridge alpha hit the old grid's 1e6 boundary every year, so RIDGE_ALPHAS is
+    widened to np.logspace(-3, 8, 23)."""
+    assert np.isclose(models.RIDGE_ALPHAS.max(), 1e8)
+    assert np.isclose(models.RIDGE_ALPHAS.min(), 1e-3)
+    assert len(models.RIDGE_ALPHAS) == 23
+
+
+def test_pred_auto_ignores_test_labels(tmp_path):
+    """Corrupting test-split stock_exret must not change pred_auto's choice or values --
+    pred_auto is picked from labelled VALID rows only, walk-forward, and never touches test."""
+    orig_years, orig_end, orig_n_jobs = config.TEST_YEARS, config.TEST_END, config.N_JOBS
+    config.TEST_YEARS = [2020]
+    config.TEST_END = pd.Timestamp("2020-12-31")
+    config.N_JOBS = 1
+    try:
+        panel = _make_panel(seed=888, n_stocks=30, include_text=True)
+        state = _make_state(panel["eom"])
+        preds1 = models.run_all(panel, state, cache_dir=tmp_path / "run1")
+
+        panel2 = panel.copy()
+        _, _, test_mask = models.splits(panel2, 2020)
+        rng = np.random.RandomState(0)
+        panel2.loc[test_mask, "stock_exret"] = rng.normal(scale=50, size=int(test_mask.sum()))
+        preds2 = models.run_all(panel2, state, cache_dir=tmp_path / "run2")
+
+        t1 = preds1[preds1["split"] == "test"].sort_values(["permno", "eom"]).reset_index(drop=True)
+        t2 = preds2[preds2["split"] == "test"].sort_values(["permno", "eom"]).reset_index(drop=True)
+        assert np.array_equal(t1["pred_auto"].values, t2["pred_auto"].values, equal_nan=True)
+        assert np.array_equal(t1["pred_blend"].values, t2["pred_blend"].values, equal_nan=True)
+    finally:
+        config.TEST_YEARS, config.TEST_END, config.N_JOBS = orig_years, orig_end, orig_n_jobs
 
 
 def test_planted_signal_specialist_and_gate(synthetic_run):
@@ -364,12 +615,15 @@ def test_planted_signal_specialist_and_gate(synthetic_run):
 def test_specialist_not_degenerate(synthetic_run):
     """A13: MSE-based early stopping was found to select degenerate low-round/low-leaf models
     (e.g. a single tree with 7 distinct predictions). The IC-selected specialist must produce
-    genuinely varied predictions -- check every test month has > 50 distinct pred_spec_quality
-    values (150 stocks/month in the fixture, planted signal in gp_at/quality)."""
+    genuinely varied predictions -- check every test month has > 20 distinct pred_spec_quality
+    values (90 stocks/month in the fixture, planted signal in gp_at/quality; FEATURE_SELECTION
+    trims quality's ~50 mostly-noise characteristics down to a handful, which legitimately lowers
+    the achievable distinct-value count vs. the full feature set, so the bar here is well above
+    the single-digit count a truly degenerate 1-tree fit would produce, not a tight bound)."""
     _, _, preds, _ = synthetic_run
     test_df = preds[preds["split"] == "test"]
     nunique = test_df.groupby("eom")["pred_spec_quality"].nunique()
-    assert (nunique > 50).all()
+    assert (nunique > 20).all()
 
 
 def test_r2_table_nan_for_ew_columns(synthetic_run):

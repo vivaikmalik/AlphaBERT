@@ -25,6 +25,8 @@ from sklearn.model_selection import GroupKFold
 import lightgbm as lgb
 
 from src import config
+from src import geometry
+from src import selection
 from src.data import feature_columns
 from src.text import TEXT_FEATURES
 
@@ -94,6 +96,20 @@ def _assert_text_features_present(panel):
     )
 
 
+# Candidates fit or tuned using the valid window itself (the gate is a ridge fit on labelled
+# valid rows; OLS/Ridge/Lasso/ElasticNet alphas are chosen by valid MSE) -- HEADLINE_CANDIDATES
+# must exclude all of these, or pred_auto's walk-forward model choice (picked by valid IC) would
+# not be genuinely out-of-sample on valid (A12).
+_VALID_FIT_OR_TUNED = {"pred_gate", "pred_gate_notext", "pred_ols", "pred_ridge", "pred_lasso", "pred_enet"}
+
+
+def _assert_headline_candidates_oos(candidates):
+    bad = _VALID_FIT_OR_TUNED & set(candidates)
+    assert not bad, (
+        f"config.HEADLINE_CANDIDATES contains models fit/tuned on the validation window: {bad}"
+    )
+
+
 # ---------------------------------------------------------------- splits ---
 def splits(panel, test_year):
     """Train/valid/test row masks (SPEC section 2). Train rows require a non-null
@@ -129,7 +145,7 @@ def make_target(df):
 
 
 # -------------------------------------------------------------- baselines --
-RIDGE_ALPHAS = np.logspace(-3, 6, 19)
+RIDGE_ALPHAS = np.logspace(-3, 8, 23)
 LASSO_ALPHAS = np.logspace(-8, -1, 15)
 ENET_ALPHAS = np.logspace(-8, -1, 15)
 MAX_ROWS_PENALIZED = 100_000  # subsample cap for the Ridge/Lasso/ElasticNet alpha search
@@ -162,17 +178,17 @@ def _warn_if_boundary(name, alpha, alphas):
 
 # (model class, alpha grid, extra kwargs, subsample cap for the alpha search)
 _PENALIZED_SPECS = [
-    ("ridge", Ridge, RIDGE_ALPHAS, {}, None),
+    ("ridge", Ridge, RIDGE_ALPHAS, {}, MAX_ROWS_PENALIZED),
     ("lasso", Lasso, LASSO_ALPHAS, {"max_iter": 5000}, MAX_ROWS_PENALIZED),
     ("enet", ElasticNet, ENET_ALPHAS, {"max_iter": 5000, "l1_ratio": 0.5}, MAX_ROWS_PENALIZED),
 ]
 
 
 def fit_baselines(Xtr, ytr, Xva, yva):
-    """OLS, Ridge, Lasso, ElasticNet. Alpha is chosen on labelled-valid MSE (possibly on a
-    subsample for Lasso/ElasticNet), then each model is refit on the FULL training window at its
-    chosen alpha. These are template baselines (not gate inputs), so using the official valid
-    window for alpha selection is fine."""
+    """OLS, Ridge, Lasso, ElasticNet. Alpha is chosen on labelled-valid MSE (the search is
+    subsampled to MAX_ROWS_PENALIZED rows for Ridge/Lasso/ElasticNet), then each model is refit on
+    the FULL training window at its chosen alpha. These are template baselines (not gate inputs),
+    so using the official valid window for alpha selection is fine."""
     Xtr = np.asarray(Xtr, dtype=np.float32)
     Xva = np.asarray(Xva, dtype=np.float32)
     out = {"ols": LinearRegression().fit(Xtr, ytr)}
@@ -231,15 +247,25 @@ def _fit_lgbm_tuned(Xtr, ytr, Xva, yva, months_va):
     return best_leaves, best_rounds, best_ic
 
 
+def _inner_holdout_mask(target_month):
+    """Boolean array, True for rows in the last INNER_HOLDOUT_MONTHS target months of the given
+    (train) target_month values. Shared by _fit_specialist, which tunes num_leaves/rounds on this
+    holdout, and run_all's feature-selection call, which must EXCLUDE it -- selection must never
+    see the months later used to tune the specialists, or its inner-holdout IC would be
+    optimistic."""
+    tm = np.asarray(target_month)
+    months = np.sort(np.unique(tm))
+    ho = min(INNER_HOLDOUT_MONTHS, max(1, len(months) - 1))
+    return np.isin(tm, months[-ho:])
+
+
 def _fit_specialist(train_df, y_train, feature_cols, label=None):
     """Tune (num_leaves, rounds) on an inner holdout = the last INNER_HOLDOUT_MONTHS target
     months of train, then refit on the FULL training window. Never touches the official valid
     window, so specialist forecasts on valid are genuinely OOS (A2). If `label` is given, prints
     the chosen num_leaves/rounds and inner-holdout IC (A13)."""
     tm = train_df["target_month"].values
-    months = np.sort(np.unique(tm))
-    ho = min(INNER_HOLDOUT_MONTHS, max(1, len(months) - 1))
-    is_ho = np.isin(tm, months[-ho:])
+    is_ho = _inner_holdout_mask(tm)
     X = train_df[feature_cols].astype(np.float32).values
     num_leaves, num_rounds, ic = _fit_lgbm_tuned(
         X[~is_ho], y_train[~is_ho], X[is_ho], y_train[is_ho], tm[is_ho])
@@ -326,16 +352,28 @@ def gate_coefs_frame(model, columns, test_year, mu, sd):
     return pd.DataFrame(rows)
 
 
+def _fallback_group_cols(report_df, group_cols, min_per_group):
+    """Used when feature selection drops every one of a char group's columns: falls back to that
+    group's top `min_per_group` candidate features by |ic_t|. Relies on `report_df` (from
+    selection.select_features) carrying an 'ic_t' column for every candidate feature it considered
+    -- selected or not -- keyed by 'feature', so this fallback always has something to rank from."""
+    cand = report_df[report_df["feature"].isin(group_cols)].copy()
+    cand["_abs_ic_t"] = cand["ic_t"].abs()
+    return cand.sort_values("_abs_ic_t", ascending=False)["feature"].head(min_per_group).tolist()
+
+
 # --------------------------------------------------------------- run_all ---
 PRED_COLS = [
     "pred_ols", "pred_ridge", "pred_lasso", "pred_enet", "pred_lgbm_all",
     "pred_spec_value", "pred_spec_momentum", "pred_spec_quality",
     "pred_spec_investment_growth", "pred_spec_risk_liquidity", "pred_spec_text",
     "pred_gate", "pred_gate_notext", "pred_ew_ret", "pred_ew", "pred_ew_notext",
+    "pred_blend", "pred_auto",
 ]
 # Return-unit forecasts get an OOS R2 in r2_table; pred_ew/pred_ew_notext blend z-scores (not
-# returns), so their R2 would not be meaningful -- IC only for those two.
-R2_COLS = [c for c in PRED_COLS if c not in ("pred_ew", "pred_ew_notext")]
+# returns), pred_blend blends two z-scores, and pred_auto is whichever HEADLINE_CANDIDATES column
+# was picked (itself z-valued or z-blended) -- so none of the four have a meaningful R2, IC only.
+R2_COLS = [c for c in PRED_COLS if c not in ("pred_ew", "pred_ew_notext", "pred_blend", "pred_auto")]
 
 
 def run_all(panel, state, cache_dir=None):
@@ -344,8 +382,10 @@ def run_all(panel, state, cache_dir=None):
 
     t0 = time.time()
     _assert_text_features_present(panel)
+    _assert_headline_candidates_oos(config.HEADLINE_CANDIDATES)
     feature_cols = feature_columns(panel)
-    text_cols = [c for c in TEXT_FEATURES if c in panel.columns]
+    text_cols = [c for c in list(TEXT_FEATURES) + list(geometry.GEOMETRY_FEATURES)
+                 if c in panel.columns]
     _assert_no_leakage(feature_cols)
     _assert_no_leakage(text_cols)
 
@@ -356,7 +396,7 @@ def run_all(panel, state, cache_dir=None):
     }
     specialists_all = list(CHAR_GROUPS) + ["text"]
 
-    all_frames, all_gate = [], []
+    all_frames, all_gate, all_selected, all_headline = [], [], [], []
     for test_year in config.TEST_YEARS:
         ty0 = time.time()
         train_mask, valid_mask, test_mask = splits(panel, test_year)
@@ -367,20 +407,47 @@ def run_all(panel, state, cache_dir=None):
         yva_full = make_target(valid)  # NaN for unlabelled valid rows, by construction
         yva_lab = yva_full.loc[valid_lab].values
 
-        preds = {}  # name -> {'valid': arr (all valid rows), 'test': arr (all test rows)}
-        Xva_all = valid[feature_cols].astype(np.float32).values
-        Xva_lab = Xva_all[valid_lab.values]
-        Xte_all = test[feature_cols].astype(np.float32).values
+        # Feature selection (per test year, TRAINING rows only -- walk-forward, never touches
+        # valid/test). Also excludes train's inner-holdout months (the last INNER_HOLDOUT_MONTHS
+        # target months), since those are later used to tune each specialist's num_leaves/rounds
+        # in _fit_specialist -- selection must not see them, or its report's IC would be
+        # optimistic for the very rows tuning is scored on. report_df must cover every candidate
+        # feature (selected or not) with an 'ic_t' column, so the per-group fallback below always
+        # has something to rank.
+        # A16: when FEATURE_SELECTION is False but SELECTION_REPORT is True, the report is still
+        # computed and written (selected_features.csv) for inspection, but every model below is
+        # fit on the FULL feature set (report_cols is not used for fitting in that case).
+        want_report = config.FEATURE_SELECTION or getattr(config, "SELECTION_REPORT", True)
+        if want_report:
+            is_ho = _inner_holdout_mask(train["target_month"].values)
+            report_cols, sel_report = selection.select_features(
+                train.loc[~is_ho], ytr[~is_ho], feature_cols, CHAR_GROUPS)
+            sel_report = sel_report.copy()
+            sel_report["test_year"] = test_year
+            all_selected.append(sel_report)
+        else:
+            report_cols, sel_report = feature_cols, None
+        sel_cols = report_cols if config.FEATURE_SELECTION else feature_cols
 
-        base = fit_baselines(train[feature_cols].astype(np.float32).values, ytr, Xva_lab, yva_lab)
+        preds = {}  # name -> {'valid': arr (all valid rows), 'test': arr (all test rows)}
+        Xva_all = valid[sel_cols].astype(np.float32).values
+        Xva_lab = Xva_all[valid_lab.values]
+        Xte_all = test[sel_cols].astype(np.float32).values
+
+        base = fit_baselines(train[sel_cols].astype(np.float32).values, ytr, Xva_lab, yva_lab)
         for name, m in base.items():
             preds[f"pred_{name}"] = _predict_both(m, Xva_all, Xte_all)
 
-        lgbm_all = _fit_specialist(train, ytr, feature_cols, label=f"lgbm_all y={test_year}")
+        lgbm_all = _fit_specialist(train, ytr, sel_cols, label=f"lgbm_all y={test_year}")
         preds["pred_lgbm_all"] = _predict_both(lgbm_all, Xva_all, Xte_all)
 
         for g in CHAR_GROUPS:
             cols = group_cols[g]
+            if config.FEATURE_SELECTION:
+                sel_set = set(sel_cols)
+                cols = [c for c in cols if c in sel_set]
+                if not cols:
+                    cols = _fallback_group_cols(sel_report, group_cols[g], config.SELECTION_MIN_PER_GROUP)
             m = _fit_specialist(train, ytr, cols, label=f"{g} y={test_year}")
             preds[f"pred_spec_{g}"] = _predict_both(
                 m, valid[cols].astype(np.float32).values, test[cols].astype(np.float32).values)
@@ -438,6 +505,30 @@ def run_all(panel, state, cache_dir=None):
             "test": Z_test[nt].mean(axis=1).values,
         }
 
+        # pred_blend: mean of within-eom z-scores of pred_ew and pred_lgbm_all.
+        preds["pred_blend"] = {
+            split: (_zscore_by_eom(preds["pred_ew"][split], df["eom"]).values
+                    + _zscore_by_eom(preds["pred_lgbm_all"][split], df["eom"]).values) / 2.0
+            for split, df in (("valid", valid), ("test", test))
+        }
+
+        # pred_auto: per test year, the HEADLINE_CANDIDATES column with the best mean monthly
+        # Spearman IC on THAT year's own labelled valid rows -- walk-forward model choice, never
+        # touches test rows/labels.
+        valid_ic_df = pd.DataFrame({"eom": eom_valid_lab.values,
+                                     "stock_exret": valid.loc[valid_lab, "stock_exret"].values})
+        cand_ic = {}
+        for cand in config.HEADLINE_CANDIDATES:
+            valid_ic_df["_cand"] = preds[cand]["valid"][valid_lab.values]
+            cand_ic[cand] = monthly_ic(valid_ic_df, "_cand").mean()
+        chosen = max(cand_ic, key=cand_ic.get)
+        all_headline.append(pd.DataFrame({
+            "test_year": test_year, "candidate": list(cand_ic.keys()),
+            "valid_mean_ic": list(cand_ic.values()),
+            "chosen": [c == chosen for c in cand_ic],
+        }))
+        preds["pred_auto"] = {"valid": preds[chosen]["valid"], "test": preds[chosen]["test"]}
+
         def _mk(df, split_label):
             out = pd.DataFrame({
                 "permno": df["permno"].values, "eom": df["eom"].values,
@@ -449,9 +540,7 @@ def run_all(panel, state, cache_dir=None):
                 out[name] = preds[name][split_label]
             return out
 
-        frames = [_mk(test, "test")]
-        if test_year == config.TEST_YEARS[0]:
-            frames.append(_mk(valid, "valid"))  # all valid rows, incl. null-label (A11)
+        frames = [_mk(test, "test"), _mk(valid, "valid")]  # all valid rows, incl. null-label (A11)
         all_frames.append(pd.concat(frames, ignore_index=True))
         print(f"[models.run_all] test_year={test_year} train={len(train)} "
               f"valid={len(valid)} (labelled={int(valid_lab.sum())}) test={len(test)} "
@@ -461,6 +550,11 @@ def run_all(panel, state, cache_dir=None):
     gate_df = pd.concat(all_gate, ignore_index=True)
     preds_df.to_parquet(cache_dir / "preds.parquet")
     gate_df.to_parquet(cache_dir / "gate_coefs.parquet")
+    if all_selected:
+        pd.concat(all_selected, ignore_index=True).to_csv(
+            config.TABLE_DIR / "selected_features.csv", index=False)
+    pd.concat(all_headline, ignore_index=True).to_csv(
+        config.TABLE_DIR / "headline_choice.csv", index=False)
     print(f"[models.run_all] done in {time.time() - t0:.1f}s")
     return preds_df
 

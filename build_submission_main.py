@@ -1,5 +1,5 @@
-"""Build the single-file submission (docs/SPEC.md A6): concatenate src/{config,data,text,models,
-portfolio,evaluate}.py and MAIN.py's body into outputs/submission/MAIN.py, needing no src/
+"""Build the single-file submission (docs/SPEC.md A6): concatenate src/{config,beta,data,text,geometry,
+selection,models,portfolio,evaluate}.py and MAIN.py's body into outputs/submission/MAIN.py, needing no src/
 package. Each module's stripped source is embedded verbatim as an `r'''<source>'''` raw string
 literal (under a `# ===== src/x.py =====` banner, so a judge can read the whole bundle top to
 bottom without any repr()-escaping noise) and exec'd into its own module object, pre-seeded with
@@ -52,21 +52,34 @@ def _load_module(name, source, **deps):
 
 def build():
     src = ROOT / 'src'
-    m = {n: _stripped(src / f'{n}.py') for n in ('data', 'text', 'models', 'portfolio', 'evaluate')}
+    m = {n: _stripped(src / f'{n}.py')
+         for n in ('beta', 'data', 'text', 'geometry', 'selection', 'models', 'portfolio', 'evaluate')}
     m['config'] = _config_source()
 
     blocks = [
         "# ===== src/config.py =====\n"
         f"config = _load_module('config', {_as_raw_literal('config', m['config'])})\n",
 
+        "# ===== src/beta.py =====\n"
+        f"beta = _load_module('beta', {_as_raw_literal('beta', m['beta'])}, config=config)\n",
+
         "# ===== src/data.py =====\n"
-        f"data = _load_module('data', {_as_raw_literal('data', m['data'])}, config=config)\n",
+        f"data = _load_module('data', {_as_raw_literal('data', m['data'])}, config=config,\n"
+        f"    beta_mod=beta, compute_betas=beta.compute_betas)\n"
+        "beta.data = data  # beta.py imports data lazily inside functions (circular at load time)\n",
 
         "# ===== src/text.py =====\n"
         f"text = _load_module('text', {_as_raw_literal('text', m['text'])}, config=config, data=data)\n",
 
+        "# ===== src/geometry.py =====\n"
+        f"geometry = _load_module('geometry', {_as_raw_literal('geometry', m['geometry'])}, config=config, text=text)\n",
+
+        "# ===== src/selection.py =====\n"
+        f"selection = _load_module('selection', {_as_raw_literal('selection', m['selection'])}, config=config)\n",
+
         "# ===== src/models.py =====\n"
         f"models = _load_module('models', {_as_raw_literal('models', m['models'])}, config=config,\n"
+        f"    geometry=geometry, selection=selection,\n"
         f"    feature_columns=data.feature_columns, TEXT_FEATURES=text.TEXT_FEATURES)\n",
 
         "# ===== src/portfolio.py =====\n"

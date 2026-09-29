@@ -289,6 +289,44 @@ def test_gate_weight_series_hand_computed():
     assert out.loc[pd.Timestamp('2021-01-31'), 'value'] == pytest.approx(0.13)
 
 
+# ---------------------------------------------------------------- neutrality_table
+def test_neutrality_table_recovers_planted_beta():
+    """Synthetic 3-year monthly series with a planted beta=0.05 (near-neutral) and a known net
+    exposure / ex-ante beta -- neutrality_table should recover the full-period beta, report one
+    row per calendar year, and pass through the exposure/correlation diagnostics untouched."""
+    rng = np.random.default_rng(11)
+    idx = pd.date_range('2021-01-31', '2023-12-31', freq='ME')
+    n = len(idx)
+    rf_m = pd.Series(0.001, index=idx)
+    sp500_exret = pd.Series(rng.normal(0, 0.04, n), index=idx)
+    sp500_ret = sp500_exret + rf_m
+    planted_beta = 0.05
+    noise = rng.normal(0, 0.01, n)
+    total_ret = rf_m + 0.001 + planted_beta * sp500_exret + noise
+    returns = pd.DataFrame({
+        'total_ret': total_ret, 'rf_m': rf_m, 'sp500_exret': sp500_exret, 'sp500_ret': sp500_ret,
+        'beta_exante': pd.Series(0.02, index=idx), 'net': pd.Series(0.0, index=idx),
+    }, index=idx)
+    returns.loc[idx[0], 'net'] = 0.03
+    returns.loc[idx[-1], 'net'] = -0.01
+
+    tbl = ev.neutrality_table(returns)
+    assert tbl.loc['beta_full_period', 'value'] == pytest.approx(planted_beta, abs=0.05)
+    assert np.isfinite(tbl.loc['beta_full_period', 'se'])
+    assert np.isfinite(tbl.loc['beta_full_period', 't_stat'])
+    for year in (2021, 2022, 2023):
+        assert f'beta_{year}' in tbl.index
+        assert np.isfinite(tbl.loc[f'beta_{year}', 'value'])
+    assert tbl.loc['avg_ex_ante_beta', 'value'] == pytest.approx(0.02)
+    assert tbl.loc['max_net_exposure', 'value'] == pytest.approx(0.03)
+    assert tbl.loc['min_net_exposure', 'value'] == pytest.approx(-0.01)
+    assert tbl.loc['avg_net_exposure', 'value'] == pytest.approx(returns['net'].mean())
+    assert tbl.loc['corr_sp500', 'value'] == pytest.approx(total_ret.corr(sp500_ret))
+    # se/t_stat are beta-row-only
+    assert np.isnan(tbl.loc['avg_ex_ante_beta', 'se'])
+    assert np.isnan(tbl.loc['corr_sp500', 't_stat'])
+
+
 # ---------------------------------------------------------------- window restriction / assert
 def test_restrict_window_asserts_on_missing_month():
     idx = pd.date_range(config.TEST_START, config.TEST_END, freq='ME').delete(5)
@@ -372,7 +410,7 @@ def test_run_evaluation_writes_tables_and_charts(tmp_path, monkeypatch):
                                   sensitivity_returns=sensitivity_returns)
 
     for key in ('ir', 'ir_net', 'sharpe', 'alpha_ann', 'alpha_t_nw', 'beta', 'beta_se_nw',
-                'max_dd', 'avg_turnover', 'cagr', 'avg_n_long', 'avg_n_short',
+                'beta_t_nw', 'max_dd', 'avg_turnover', 'cagr', 'avg_n_long', 'avg_n_short',
                 'sensitivity_ir', 'sensitivity_sharpe', 'sensitivity_alpha_ann', 'sensitivity_beta'):
         assert key in headline
         assert np.isfinite(headline[key])
@@ -382,7 +420,7 @@ def test_run_evaluation_writes_tables_and_charts(tmp_path, monkeypatch):
     expected_pngs = [
         'cumulative_returns.png', 'underwater.png', 'rolling_active_return.png',
         'rolling_ir.png', 'rolling_beta.png', 'return_histogram.png', 'contributors.png',
-        'gate_weights.png',
+        'gate_weights.png', 'beta_by_year.png',
     ]
     for name in expected_pngs:
         assert (fig_dir / name).exists()
@@ -390,10 +428,15 @@ def test_run_evaluation_writes_tables_and_charts(tmp_path, monkeypatch):
     expected_csvs = [
         'performance_table.csv', 'alpha_beta.csv', 'calendar_year_table.csv',
         'exposure_table.csv', 'short_book_table.csv', 'contributors.csv',
-        'top_holdings.csv', 'regime_table.csv', 'sensitivity_table.csv',
+        'top_holdings.csv', 'regime_table.csv', 'sensitivity_table.csv', 'neutrality_table.csv',
     ]
     for name in expected_csvs:
         assert (table_dir / name).exists()
+
+    neutrality = pd.read_csv(table_dir / 'neutrality_table.csv', index_col=0)
+    assert 'beta_full_period' in neutrality.index
+    assert 'avg_ex_ante_beta' in neutrality.index
+    assert 'corr_sp500' in neutrality.index
 
     exposure = pd.read_csv(table_dir / 'exposure_table.csv', index_col=0)
     assert 'gross_min' in exposure.index
